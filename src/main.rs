@@ -14,6 +14,7 @@ use sysinfo::System;
 use shared::{GpuState, Mode, ModeCell, Shared};
 use temps::TempStats;
 
+const WINDOW_WIDTH: f32 = 380.0;
 const USAGE_REFRESH: Duration = Duration::from_millis(1000);
 
 fn main() -> eframe::Result {
@@ -33,7 +34,7 @@ fn main() -> eframe::Result {
             .with_title("PC Heater")
             .with_app_id("pc-heater")
             .with_icon(icon)
-            .with_inner_size([380.0, 330.0])
+            .with_inner_size([WINDOW_WIDTH, 380.0])
             .with_resizable(false),
         ..Default::default()
     };
@@ -67,6 +68,8 @@ struct HeaterApp {
     system: Option<System>,
     cpu_usage: f32,
     last_refresh: Instant,
+    /// Window height last requested to fit the content.
+    fitted_height: f32,
 }
 
 impl HeaterApp {
@@ -81,6 +84,7 @@ impl HeaterApp {
             system,
             cpu_usage: 0.0,
             last_refresh: Instant::now(),
+            fitted_height: 0.0,
         }
     }
 }
@@ -134,6 +138,18 @@ impl eframe::App for HeaterApp {
                 }
             }
             temp_readout(ui, "gpu_temps", &temps.gpu);
+
+            // Keep the window exactly tall enough for everything above.
+            // The cursor sits just below the last widget; the panel itself
+            // always fills the window, so its own rect can't be used here.
+            let needed = (ui.cursor().top() + 4.0).ceil();
+            if (needed - self.fitted_height).abs() > 0.5 {
+                self.fitted_height = needed;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                    WINDOW_WIDTH,
+                    needed,
+                )));
+            }
         });
     }
 }
