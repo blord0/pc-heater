@@ -1,0 +1,69 @@
+name: Release
+
+# Builds the Windows and Linux binaries and attaches them to a GitHub release.
+# Runs when a version tag (v1.2.3) is pushed, or by hand for an existing tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and release (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      # Keep a release that already exists (and its notes); otherwise make one.
+      - name: Create the release if needed
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --title "PC Heater $TAG" --generate-notes --verify-tag
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # An older Ubuntu keeps the binary usable on older distributions.
+          - os: ubuntu-22.04
+            built: target/release/pc-heater
+            asset: pc-heater-linux-x86_64
+          - os: windows-latest
+            built: target/release/pc-heater.exe
+            asset: pc-heater-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev
+
+      - name: Update Rust
+        run: rustup update stable && rustup default stable
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Upload to the release
+        run: |
+          cp "${{ matrix.built }}" "${{ matrix.asset }}"
+          gh release upload "$TAG" "${{ matrix.asset }}" --clobber

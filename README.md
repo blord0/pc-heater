@@ -27,6 +27,14 @@ Windows (cross-compiled from Linux, needs `mingw-w64` and
 
     cargo build --release --target x86_64-pc-windows-gnu
 
+## Releasing
+
+Pushing a version tag builds both binaries on GitHub and attaches them to a
+release for that tag:
+
+    git tag v0.2.0
+    git push origin v0.2.0
+
 ## Usage
 
     pc-heater [--cpu off|half|full] [--gpu off|half|full]
