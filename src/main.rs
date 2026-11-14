@@ -15,18 +15,20 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use sysinfo::System;
 
-use shared::{GpuState, Mode, ModeCell, Shared};
+use shared::{Mode, ModeCell, Shared};
 use temps::Stats;
 
 const WINDOW_WIDTH: f32 = 440.0;
 const USAGE_REFRESH: Duration = Duration::from_millis(1000);
 
 fn main() -> eframe::Result {
-    let shared = Arc::new(Shared::new());
-    if let Err(message) = apply_args(&shared) {
-        eprintln!("{message}\nusage: pc-heater [--cpu off|half|full] [--gpu off|half|full]");
-        std::process::exit(2);
-    }
+    let (cpu_mode, gpu_mode) = match parse_args() {
+        Ok(modes) => modes,
+        Err(message) => {
+            eprintln!("{message}\nusage: pc-heater [--cpu off|half|full] [--gpu off|half|full]");
+            std::process::exit(2);
+        }
+    };
 
     // Reading the CPU temperature on Windows needs administrator rights, so
     // always offer to restart elevated. If that is declined, carry on
@@ -39,8 +41,17 @@ fn main() -> eframe::Result {
         return Ok(());
     }
 
+    let (adapters, slots): (Vec<_>, Vec<_>) = gpu::discover().into_iter().unzip();
+    let shared = Arc::new(Shared::new(slots));
+    shared.cpu.set(cpu_mode);
+    for slot in &shared.gpus {
+        slot.mode.set(gpu_mode);
+    }
+
     let cpu_threads = cpu::spawn(shared.clone());
-    gpu::spawn(shared.clone());
+    for (index, adapter) in adapters.into_iter().enumerate() {
+        gpu::spawn(shared.clone(), index, adapter);
+    }
     temps::spawn(shared.clone());
 
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
@@ -61,21 +72,22 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Optional starting modes from the command line; both default to Off.
-fn apply_args(shared: &Shared) -> Result<(), String> {
+/// Optional starting modes for the CPU and for every GPU, from the command
+/// line; both default to Off.
+fn parse_args() -> Result<(Mode, Mode), String> {
+    let (mut cpu, mut gpu) = (Mode::Off, Mode::Off);
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
-        let cell = match flag.as_str() {
-            "--cpu" => &shared.cpu,
-            "--gpu" => &shared.gpu,
+        let target = match flag.as_str() {
+            "--cpu" => &mut cpu,
+            "--gpu" => &mut gpu,
             other => return Err(format!("unknown option '{other}'")),
         };
         let value = args.next().unwrap_or_default();
-        let mode = Mode::parse(&value)
+        *target = Mode::parse(&value)
             .ok_or_else(|| format!("'{flag}' needs one of: off, half, full"))?;
-        cell.set(mode);
     }
-    Ok(())
+    Ok((cpu, gpu))
 }
 
 struct HeaterApp {
@@ -137,28 +149,31 @@ impl eframe::App for HeaterApp {
                 (&temps.cpu, temps.cpu_hint),
             );
 
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            ui.heading("GPU");
-            let state = self.shared.gpu_state.lock().unwrap();
-            match &*state {
-                GpuState::Starting => {
-                    mode_selector(ui, &self.shared.gpu, false);
-                    ui.weak("Starting…");
-                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+            if self.shared.gpus.is_empty() {
+                section_break(ui);
+                ui.heading("GPU");
+                ui.colored_label(ui.visuals().error_fg_color, "No hardware GPU found");
+            }
+            for (index, (slot, stats)) in self.shared.gpus.iter().zip(&temps.gpus).enumerate() {
+                section_break(ui);
+                if self.shared.gpus.len() == 1 {
+                    ui.heading("GPU");
+                } else {
+                    ui.heading(format!("GPU {}", index + 1));
                 }
-                GpuState::Ready(name) => {
-                    mode_selector(ui, &self.shared.gpu, true);
-                    ui.weak(name);
-                }
-                GpuState::Failed(error) => {
-                    mode_selector(ui, &self.shared.gpu, false);
+                let error = slot.error.lock().unwrap();
+                mode_selector(ui, &slot.mode, error.is_none());
+                ui.weak(&slot.name);
+                if let Some(error) = &*error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
+                readout(
+                    ui,
+                    &format!("gpu_readout_{index}"),
+                    (&stats.power, None),
+                    (&stats.temp, None),
+                );
             }
-            readout(ui, "gpu_readout", (&temps.gpu_power, None), (&temps.gpu, None));
 
             // Keep the window exactly tall enough for everything above.
             // The cursor sits just below the last widget; the panel itself
@@ -173,6 +188,12 @@ impl eframe::App for HeaterApp {
             }
         });
     }
+}
+
+fn section_break(ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    ui.separator();
+    ui.add_space(4.0);
 }
 
 fn mode_selector(ui: &mut egui::Ui, cell: &ModeCell, enabled: bool) {

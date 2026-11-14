@@ -4,6 +4,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use crate::shared::PciAddress;
 use crate::temps::EnergyCounter;
 
 fn read_number(path: &Path) -> std::io::Result<u64> {
@@ -79,21 +80,33 @@ impl CpuPower {
     }
 }
 
-/// Power draw of a non-NVIDIA graphics card in watts, from the kernel's
-/// hardware sensors (reported by amdgpu).
-pub fn gpu_watts() -> Option<f32> {
-    let entries = fs::read_dir("/sys/class/hwmon").ok()?;
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        let name = fs::read_to_string(dir.join("name")).unwrap_or_default();
-        if name.trim() != "amdgpu" {
-            continue;
-        }
-        for file in ["power1_average", "power1_input"] {
-            if let Ok(microwatts) = read_number(&dir.join(file)) {
-                return Some(microwatts as f32 / 1e6);
-            }
-        }
+/// The kernel's hardware sensors for one graphics card (amdgpu, Intel Arc,
+/// nouveau), found through the card's PCI address.
+pub struct GpuHwmon {
+    dir: PathBuf,
+}
+
+impl GpuHwmon {
+    pub fn open(address: PciAddress) -> Option<Self> {
+        let hwmon = format!(
+            "/sys/bus/pci/devices/{:04x}:{:02x}:{:02x}.{:x}/hwmon",
+            address.domain, address.bus, address.device, address.function
+        );
+        let dir = fs::read_dir(hwmon).ok()?.flatten().next()?.path();
+        Some(Self { dir })
     }
-    None
+
+    /// Temperature in °C.
+    pub fn temp(&self) -> Option<f32> {
+        let millidegrees = read_number(&self.dir.join("temp1_input")).ok()?;
+        Some(millidegrees as f32 / 1000.0)
+    }
+
+    /// Power draw in watts.
+    pub fn power(&self) -> Option<f32> {
+        ["power1_average", "power1_input"]
+            .iter()
+            .find_map(|file| read_number(&self.dir.join(file)).ok())
+            .map(|microwatts| microwatts as f32 / 1e6)
+    }
 }

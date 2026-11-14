@@ -50,26 +50,60 @@ impl ModeCell {
     }
 }
 
-pub enum GpuState {
-    Starting,
-    Ready(String),
-    Failed(String),
+pub const VENDOR_NVIDIA: u32 = 0x10DE;
+#[cfg(windows)]
+pub const VENDOR_AMD: u32 = 0x1002;
+
+/// Where a card sits on the PCI bus. Used to tie sensor readings to the
+/// card they belong to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PciAddress {
+    pub domain: u32,
+    pub bus: u32,
+    pub device: u32,
+    pub function: u32,
+}
+
+impl PciAddress {
+    /// Parse the usual `0000:01:00.0` form.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.trim().split(':');
+        let (domain, bus, rest) = (parts.next()?, parts.next()?, parts.next()?);
+        let (device, function) = rest.split_once('.')?;
+        let hex = |digits: &str| u32::from_str_radix(digits, 16).ok();
+        Some(Self {
+            domain: hex(domain)?,
+            bus: hex(bus)?,
+            device: hex(device)?,
+            function: hex(function)?,
+        })
+    }
+}
+
+/// One graphics card being heated.
+pub struct GpuSlot {
+    pub name: String,
+    /// PCI vendor ID.
+    pub vendor: u32,
+    pub address: Option<PciAddress>,
+    pub mode: ModeCell,
+    /// Set if the card's load could not be started or stopped working.
+    pub error: Mutex<Option<String>>,
 }
 
 pub struct Shared {
     pub cpu: ModeCell,
-    pub gpu: ModeCell,
-    pub gpu_state: Mutex<GpuState>,
+    pub gpus: Vec<GpuSlot>,
     pub temps: Mutex<Temps>,
 }
 
 impl Shared {
-    pub fn new() -> Self {
+    pub fn new(gpus: Vec<GpuSlot>) -> Self {
+        let temps = Temps::new(gpus.len());
         Self {
             cpu: ModeCell::new(),
-            gpu: ModeCell::new(),
-            gpu_state: Mutex::new(GpuState::Starting),
-            temps: Mutex::new(Temps::default()),
+            gpus,
+            temps: Mutex::new(temps),
         }
     }
 }

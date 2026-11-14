@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::wgpu;
 
-use crate::shared::{GpuState, Mode, Shared, lower_thread_priority};
+use crate::shared::{GpuSlot, Mode, ModeCell, PciAddress, Shared, lower_thread_priority};
 
 /// Side length of the off-screen image the load draws into.
 const TARGET_SIZE: u32 = 2048;
@@ -68,33 +68,88 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-pub fn spawn(shared: Arc<Shared>) {
+/// Find every hardware graphics card, most powerful kind first.
+pub fn discover() -> Vec<(wgpu::Adapter, GpuSlot)> {
+    catch_unwind(|| {
+        let instance = wgpu::Instance::default();
+        let mut adapters =
+            pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY));
+        // A card can show up once per graphics API. Keep the native one:
+        // DirectX 12 on Windows, Vulkan elsewhere.
+        let preferred = if cfg!(windows) {
+            wgpu::Backend::Dx12
+        } else {
+            wgpu::Backend::Vulkan
+        };
+        adapters.sort_by_key(|adapter| {
+            let info = adapter.get_info();
+            let kind = match info.device_type {
+                wgpu::DeviceType::DiscreteGpu => 0,
+                wgpu::DeviceType::IntegratedGpu => 1,
+                _ => 2,
+            };
+            (kind, info.backend != preferred)
+        });
+
+        let mut seen = Vec::new();
+        let mut found = Vec::new();
+        for adapter in adapters {
+            let info = adapter.get_info();
+            // Software renderers would just be a second CPU load.
+            if info.device_type == wgpu::DeviceType::Cpu {
+                continue;
+            }
+            let key = if info.device_pci_bus_id.is_empty() {
+                format!("{:x}:{:x}:{}", info.vendor, info.device, info.name)
+            } else {
+                info.device_pci_bus_id.clone()
+            };
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let slot = GpuSlot {
+                name: info.name,
+                vendor: info.vendor,
+                address: PciAddress::parse(&info.device_pci_bus_id),
+                mode: ModeCell::new(),
+                error: std::sync::Mutex::new(None),
+            };
+            found.push((adapter, slot));
+        }
+        found
+    })
+    .unwrap_or_default()
+}
+
+/// Start the load thread for the card at `index` in `shared.gpus`.
+pub fn spawn(shared: Arc<Shared>, index: usize, adapter: wgpu::Adapter) {
     thread::Builder::new()
-        .name("gpu-heater".into())
+        .name(format!("gpu-heater-{index}"))
         .spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| run(&shared)));
+            let slot = &shared.gpus[index];
+            let result = catch_unwind(AssertUnwindSafe(|| run(slot, &adapter)));
             let message = match result {
                 Ok(Ok(())) => return,
                 Ok(Err(e)) => e,
                 Err(_) => "GPU worker crashed".to_owned(),
             };
-            shared.gpu.set(Mode::Off);
-            *shared.gpu_state.lock().unwrap() = GpuState::Failed(message);
+            slot.mode.set(Mode::Off);
+            *slot.error.lock().unwrap() = Some(message);
         })
         .expect("failed to spawn GPU worker");
 }
 
-fn run(shared: &Shared) -> Result<(), String> {
+fn run(slot: &GpuSlot, adapter: &wgpu::Adapter) -> Result<(), String> {
     lower_thread_priority();
-    let mut burner = Burner::new()?;
-    *shared.gpu_state.lock().unwrap() = GpuState::Ready(burner.name.clone());
+    let mut burner = Burner::new(adapter)?;
 
     loop {
-        match shared.gpu.get() {
+        match slot.mode.get() {
             Mode::Off => thread::sleep(IDLE_POLL),
             Mode::Full => {
                 burner.calibrate()?;
-                burner.burn_while(|| shared.gpu.get() == Mode::Full)?;
+                burner.burn_while(|| slot.mode.get() == Mode::Full)?;
             }
             Mode::Half => {
                 burner.calibrate()?;
@@ -108,7 +163,6 @@ fn run(shared: &Shared) -> Result<(), String> {
 }
 
 struct Burner {
-    name: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
@@ -120,21 +174,7 @@ struct Burner {
 }
 
 impl Burner {
-    fn new() -> Result<Self, String> {
-        let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("No GPU found: {e}"))?;
-
-        let info = adapter.get_info();
-        if info.device_type == wgpu::DeviceType::Cpu {
-            return Err(format!("No hardware GPU found (only {})", info.name));
-        }
-
+    fn new(adapter: &wgpu::Adapter) -> Result<Self, String> {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("heater"),
             ..Default::default()
@@ -238,7 +278,6 @@ impl Burner {
         });
 
         Ok(Self {
-            name: info.name,
             device,
             queue,
             pipeline,

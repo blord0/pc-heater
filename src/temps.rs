@@ -7,7 +7,7 @@ use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use sysinfo::Components;
 
-use crate::shared::Shared;
+use crate::shared::{GpuSlot, Shared, VENDOR_NVIDIA};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Samples kept for the rolling average (5 minutes at one per second).
@@ -61,15 +61,33 @@ impl Stats {
     }
 }
 
+/// Readings for one graphics card.
 #[derive(Default)]
+pub struct GpuStats {
+    pub temp: Stats,
+    pub power: Stats,
+}
+
 pub struct Temps {
     pub cpu: Stats,
-    pub gpu: Stats,
     pub cpu_power: Stats,
-    pub gpu_power: Stats,
+    /// One entry per card, in the same order as `Shared::gpus`.
+    pub gpus: Vec<GpuStats>,
     /// What the user can do to get a CPU reading, when there is none.
     pub cpu_hint: Option<&'static str>,
     pub cpu_power_hint: Option<&'static str>,
+}
+
+impl Temps {
+    pub fn new(gpu_count: usize) -> Self {
+        Self {
+            cpu: Stats::default(),
+            cpu_power: Stats::default(),
+            gpus: (0..gpu_count).map(|_| GpuStats::default()).collect(),
+            cpu_hint: None,
+            cpu_power_hint: None,
+        }
+    }
 }
 
 /// Turns a cumulative hardware energy counter into average watts between
@@ -105,7 +123,7 @@ pub fn spawn(shared: Arc<Shared>) {
     thread::Builder::new()
         .name("temp-monitor".into())
         .spawn(move || {
-            let mut sensors = Sensors::new();
+            let mut sensors = Sensors::new(&shared.gpus);
             sensors.publish_hints(&shared);
 
             // Running as administrator without the driver: install it in the
@@ -131,9 +149,11 @@ pub fn spawn(shared: Arc<Shared>) {
                 {
                     let mut temps = shared.temps.lock().unwrap();
                     temps.cpu.record(sample.cpu_temp);
-                    temps.gpu.record(sample.gpu_temp);
                     temps.cpu_power.record(sample.cpu_power);
-                    temps.gpu_power.record(sample.gpu_power);
+                    for (stats, (temp, power)) in temps.gpus.iter_mut().zip(sample.gpus) {
+                        stats.temp.record(temp);
+                        stats.power.record(power);
+                    }
                 }
                 thread::sleep(SAMPLE_INTERVAL);
             }
@@ -143,9 +163,82 @@ pub fn spawn(shared: Arc<Shared>) {
 
 struct Sample {
     cpu_temp: Option<f32>,
-    gpu_temp: Option<f32>,
     cpu_power: Option<f32>,
-    gpu_power: Option<f32>,
+    /// Temperature and power per card.
+    gpus: Vec<(Option<f32>, Option<f32>)>,
+}
+
+/// Where one card's readings come from.
+enum GpuSensor {
+    /// Index of the card in the NVIDIA driver's own list.
+    Nvidia(u32),
+    #[cfg(windows)]
+    Amd(crate::winsensor::AmdGpu),
+    #[cfg(target_os = "linux")]
+    Hwmon(crate::linsensor::GpuHwmon),
+    None,
+}
+
+impl GpuSensor {
+    /// Find the sensor belonging to `slots[index]`, by PCI address where
+    /// known and otherwise by its position among cards of the same vendor.
+    fn find(nvml: Option<&Nvml>, slots: &[GpuSlot], index: usize) -> Self {
+        let slot = &slots[index];
+        let ordinal = slots[..index]
+            .iter()
+            .filter(|other| other.vendor == slot.vendor)
+            .count();
+
+        if slot.vendor == VENDOR_NVIDIA
+            && let Some(nvml) = nvml
+        {
+            let count = nvml.device_count().unwrap_or(0);
+            let by_address = slot.address.and_then(|address| {
+                (0..count).find(|&i| {
+                    nvml.device_by_index(i)
+                        .and_then(|device| device.pci_info())
+                        .is_ok_and(|pci| pci.bus == address.bus && pci.device == address.device)
+                })
+            });
+            if let Some(i) = by_address.or(((ordinal as u32) < count).then_some(ordinal as u32)) {
+                return Self::Nvidia(i);
+            }
+        }
+        #[cfg(windows)]
+        if slot.vendor == crate::shared::VENDOR_AMD {
+            let address = slot.address.map(|address| (address.bus, address.device));
+            if let Some(gpu) = crate::winsensor::AmdGpu::open(address, ordinal) {
+                return Self::Amd(gpu);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(hwmon) = slot.address.and_then(crate::linsensor::GpuHwmon::open) {
+            return Self::Hwmon(hwmon);
+        }
+        Self::None
+    }
+
+    /// Temperature in °C and power in watts.
+    fn read(&self, nvml: Option<&Nvml>) -> (Option<f32>, Option<f32>) {
+        match self {
+            Self::Nvidia(index) => {
+                let Some(device) = nvml.and_then(|nvml| nvml.device_by_index(*index).ok()) else {
+                    return (None, None);
+                };
+                let temp = device.temperature(TemperatureSensor::Gpu).ok();
+                let power = device.power_usage().ok();
+                (
+                    temp.map(|celsius| celsius as f32),
+                    power.map(|milliwatts| milliwatts as f32 / 1000.0),
+                )
+            }
+            #[cfg(windows)]
+            Self::Amd(gpu) => (gpu.read(), gpu.power()),
+            #[cfg(target_os = "linux")]
+            Self::Hwmon(hwmon) => (hwmon.temp(), hwmon.power()),
+            Self::None => (None, None),
+        }
+    }
 }
 
 struct Sensors {
@@ -157,23 +250,25 @@ struct Sensors {
     cpu_power: crate::linsensor::CpuPower,
     #[cfg(windows)]
     driver_cpu: Option<crate::winsensor::CpuSensor>,
-    #[cfg(windows)]
-    amd_gpu: Option<crate::winsensor::AmdGpu>,
+    gpus: Vec<GpuSensor>,
 }
 
 impl Sensors {
-    fn new() -> Self {
+    fn new(slots: &[GpuSlot]) -> Self {
+        let nvml = Nvml::init().ok();
+        let gpus = (0..slots.len())
+            .map(|index| GpuSensor::find(nvml.as_ref(), slots, index))
+            .collect();
         Self {
             components: Components::new_with_refreshed_list().ok(),
-            nvml: Nvml::init().ok(),
+            nvml,
+            gpus,
             #[cfg(windows)]
             cpu_energy: EnergyCounter::default(),
             #[cfg(target_os = "linux")]
             cpu_power: crate::linsensor::CpuPower::open(),
             #[cfg(windows)]
             driver_cpu: crate::winsensor::CpuSensor::open(),
-            #[cfg(windows)]
-            amd_gpu: crate::winsensor::AmdGpu::open(),
         }
     }
 
@@ -190,37 +285,16 @@ impl Sensors {
         let cpu_temp = self
             .driver_cpu_temp()
             .or_else(|| self.component_temp(CPU_PACKAGE_LABELS, CPU_FALLBACK_LABELS));
-        let gpu_temp = self
-            .nvidia_temp()
-            .or_else(|| self.amd_gpu_temp())
-            .or_else(|| self.component_temp(GPU_LABELS, &[]));
-        let gpu_power = self.nvidia_power().or_else(|| self.other_gpu_power());
+        let gpus = self
+            .gpus
+            .iter()
+            .map(|sensor| sensor.read(self.nvml.as_ref()))
+            .collect();
         Sample {
             cpu_temp,
-            gpu_temp,
             cpu_power: self.cpu_power(),
-            gpu_power,
+            gpus,
         }
-    }
-
-    fn nvidia_power(&self) -> Option<f32> {
-        let device = self.nvml.as_ref()?.device_by_index(0).ok()?;
-        Some(device.power_usage().ok()? as f32 / 1000.0)
-    }
-
-    #[cfg(windows)]
-    fn other_gpu_power(&self) -> Option<f32> {
-        self.amd_gpu.as_ref()?.power()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn other_gpu_power(&self) -> Option<f32> {
-        crate::linsensor::gpu_watts()
-    }
-
-    #[cfg(not(any(windows, target_os = "linux")))]
-    fn other_gpu_power(&self) -> Option<f32> {
-        None
     }
 
     /// CPU package power in watts, from the processor's energy counter.
@@ -287,22 +361,6 @@ impl Sensors {
         None
     }
 
-    #[cfg(windows)]
-    fn amd_gpu_temp(&self) -> Option<f32> {
-        self.amd_gpu.as_ref()?.read()
-    }
-
-    #[cfg(not(windows))]
-    fn amd_gpu_temp(&self) -> Option<f32> {
-        None
-    }
-
-    fn nvidia_temp(&self) -> Option<f32> {
-        let device = self.nvml.as_ref()?.device_by_index(0).ok()?;
-        let celsius = device.temperature(TemperatureSensor::Gpu).ok()?;
-        Some(celsius as f32)
-    }
-
     /// Hottest sensor whose label matches `preferred`, falling back to the
     /// hottest one matching `fallback`.
     fn component_temp(&self, preferred: &[&str], fallback: &[&str]) -> Option<f32> {
@@ -327,6 +385,3 @@ const CPU_PACKAGE_LABELS: &[&str] = &["package", "tctl", "tdie"];
 /// Per-core sensors. Generic ACPI thermal zones are deliberately left out:
 /// on many desktop boards they report a fixed value unrelated to the CPU.
 const CPU_FALLBACK_LABELS: &[&str] = &["coretemp", "k10temp", "zenpower", "cpu", "core"];
-/// Non-NVIDIA GPUs that report through the kernel's hardware sensors on
-/// Linux: AMD (amdgpu/radeon), Intel Arc (i915/xe) and nouveau.
-const GPU_LABELS: &[&str] = &["amdgpu", "radeon", "i915", "xe ", "nouveau", "gpu"];

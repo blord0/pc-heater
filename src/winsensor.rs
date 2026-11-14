@@ -416,7 +416,7 @@ unsafe fn symbol<T: Copy>(library: HMODULE, name: &[u8]) -> Option<T> {
     Some(unsafe { std::mem::transmute_copy(&address) })
 }
 
-/// Edge temperature of the first AMD graphics card.
+/// Temperature and power of one AMD graphics card.
 pub struct AmdGpu {
     context: AdlContext,
     adapter: i32,
@@ -429,7 +429,9 @@ pub struct AmdGpu {
 unsafe impl Send for AmdGpu {}
 
 impl AmdGpu {
-    pub fn open() -> Option<Self> {
+    /// Open the AMD card at the given PCI bus and device number, or, when
+    /// that is unknown, the `ordinal`-th AMD card.
+    pub fn open(address: Option<(u32, u32)>, ordinal: usize) -> Option<Self> {
         unsafe {
             let library = LoadLibraryExW(
                 wide("atiadlxx.dll").as_ptr(),
@@ -469,8 +471,9 @@ impl AmdGpu {
             if info(context, infos.as_mut_ptr(), bytes) != 0 {
                 return None;
             }
-            // Each card is listed once per display output; take the first
-            // entry that both is an AMD card and gives a reading.
+            // Each card is listed once per display output: group the
+            // entries by card.
+            let mut cards: Vec<((u32, u32), Vec<i32>)> = Vec::new();
             for entry in &infos {
                 let udid = String::from_utf8_lossy(&entry.udid).to_ascii_uppercase();
                 // Some driver versions report the vendor as decimal 1002.
@@ -480,7 +483,18 @@ impl AmdGpu {
                 if !is_amd {
                     continue;
                 }
-                gpu.adapter = entry.adapter_index;
+                let location = (entry.bus_number as u32, entry.device_number as u32);
+                match cards.iter_mut().find(|(known, _)| *known == location) {
+                    Some((_, indices)) => indices.push(entry.adapter_index),
+                    None => cards.push((location, vec![entry.adapter_index])),
+                }
+            }
+            let by_address =
+                address.and_then(|wanted| cards.iter().find(|(location, _)| *location == wanted));
+            let (_, indices) = by_address.or_else(|| cards.get(ordinal))?;
+            // Use the first of the card's entries that gives a reading.
+            for &index in indices {
+                gpu.adapter = index;
                 if gpu.read().is_some() {
                     return Some(gpu);
                 }

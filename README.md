@@ -2,14 +2,18 @@
 
 Turns your PC into a space heater by loading the CPU and GPU.
 
-The CPU and GPU are controlled separately, each with three modes that can be
-switched at any time from the window:
+The CPU and each GPU are controlled separately, each with three modes that can
+be switched at any time from the window:
 
 - **Off** – no load
 - **Half** – about 50% utilisation
 - **Full** – 100% utilisation
 
-The window also shows power draw and temperature for the CPU and GPU:
+Every hardware graphics card in the machine gets its own section, so a PC
+with integrated and dedicated graphics, or several cards, can heat with all of
+them. Software renderers are ignored.
+
+The window also shows power draw and temperature for the CPU and each GPU:
 current, min, max, average since start and average over the last five minutes.
 
 ## Building
@@ -27,7 +31,8 @@ Windows (cross-compiled from Linux, needs `mingw-w64` and
 
     pc-heater [--cpu off|half|full] [--gpu off|half|full]
 
-Both start at Off unless given on the command line.
+Both start at Off unless given on the command line. `--gpu` applies to every
+card.
 
 For development on Windows, setting the environment variable
 `PC_HEATER_NO_ELEVATE` skips the administrator prompt at startup.
