@@ -213,18 +213,21 @@ impl eframe::App for HeaterApp {
                 if let Some(error) = &*error {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
-                readout(
-                    ui,
-                    &format!("gpu_readout_{index}"),
-                    // Built-in graphics draw from the processor's own supply.
-                    (
-                        &stats.power,
-                        slot.integrated.then_some("counted in the CPU figure"),
-                    ),
-                    // Graphics built into the processor have no sensor of
-                    // their own; the CPU temperature already covers them.
-                    (!slot.integrated).then_some((&stats.temp, None)),
-                );
+                if slot.integrated && !stats.power.has_data() {
+                    // Built-in graphics draw from the processor's own supply
+                    // and have no sensors of their own, so without a
+                    // separate power figure there is nothing to tabulate.
+                    ui.weak("Power: counted in the CPU figure");
+                } else {
+                    readout(
+                        ui,
+                        &format!("gpu_readout_{index}"),
+                        (&stats.power, None),
+                        // The CPU temperature already covers built-in
+                        // graphics.
+                        (!slot.integrated).then_some((&stats.temp, None)),
+                    );
+                }
             }
 
             // Keep the window exactly tall enough for everything above.
