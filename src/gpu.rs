@@ -107,7 +107,9 @@ pub fn discover() -> Vec<(wgpu::Adapter, GpuSlot)> {
         let mut found = Vec::new();
         for adapter in adapters {
             let info = adapter.get_info();
-            let (identity, address) = identify(&adapter, &info);
+            let Some((identity, address)) = identify(&adapter, &info) else {
+                continue;
+            };
             if let Some(identity) = identity {
                 if seen.contains(&identity) {
                     continue;
@@ -131,9 +133,13 @@ pub fn discover() -> Vec<(wgpu::Adapter, GpuSlot)> {
 
 /// A string that is the same for two listings of one physical card and
 /// different for two cards (None if the system offers nothing reliable),
-/// plus the card's PCI address where known.
+/// plus the card's PCI address where known. Returns None for an entry that
+/// is not a physical card at all and should be skipped.
 #[cfg(windows)]
-fn identify(adapter: &wgpu::Adapter, _info: &wgpu::AdapterInfo) -> (Option<String>, Option<PciAddress>) {
+fn identify(
+    adapter: &wgpu::Adapter,
+    _info: &wgpu::AdapterInfo,
+) -> Option<(Option<String>, Option<PciAddress>)> {
     // The bus id wgpu reports on Windows is looked up by card model, so two
     // identical cards would get the same one. Ask Windows for the adapter's
     // unique id instead and resolve the address from that.
@@ -141,23 +147,32 @@ fn identify(adapter: &wgpu::Adapter, _info: &wgpu::AdapterInfo) -> (Option<Strin
         .and_then(|hal| unsafe { hal.raw_adapter().GetDesc1() }.ok())
         .map(|desc| (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart));
     let Some((low, high)) = luid else {
-        return (None, None);
+        return Some((None, None));
     };
-    let address = crate::winsensor::adapter_address(low, high).map(|(bus, device, function)| {
-        PciAddress {
-            domain: 0,
-            bus,
-            device,
-            function,
-        }
+    let location = crate::winsensor::adapter_address(low, high);
+    // Virtual adapters (remote desktop, streaming and virtual-monitor
+    // drivers) render on a real card but sit on no bus themselves: Windows
+    // reports their location as all ones. Loading one would just load the
+    // real card a second time.
+    if location.is_some_and(|(bus, _, _)| bus == u32::MAX) {
+        return None;
+    }
+    let address = location.map(|(bus, device, function)| PciAddress {
+        domain: 0,
+        bus,
+        device,
+        function,
     });
-    (Some(format!("{high:x}:{low:x}")), address)
+    Some((Some(format!("{high:x}:{low:x}")), address))
 }
 
 #[cfg(not(windows))]
-fn identify(_adapter: &wgpu::Adapter, info: &wgpu::AdapterInfo) -> (Option<String>, Option<PciAddress>) {
+fn identify(
+    _adapter: &wgpu::Adapter,
+    info: &wgpu::AdapterInfo,
+) -> Option<(Option<String>, Option<PciAddress>)> {
     let address = PciAddress::parse(&info.device_pci_bus_id);
-    (address.map(|_| info.device_pci_bus_id.clone()), address)
+    Some((address.map(|_| info.device_pci_bus_id.clone()), address))
 }
 
 /// Start the load thread for the card at `index` in `shared.gpus`.
