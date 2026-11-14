@@ -100,24 +100,24 @@ pub fn discover() -> Vec<(wgpu::Adapter, GpuSlot)> {
             _ => 2,
         });
 
-        // Even one API can list a card more than once.
+        // Even one API can list a card more than once. Only entries with
+        // the same hardware identity are merged; model and name are not
+        // enough, since two identical cards share those.
         let mut seen = Vec::new();
         let mut found = Vec::new();
         for adapter in adapters {
             let info = adapter.get_info();
-            let key = if info.device_pci_bus_id.is_empty() {
-                format!("{:x}:{:x}:{}", info.vendor, info.device, info.name)
-            } else {
-                info.device_pci_bus_id.clone()
-            };
-            if seen.contains(&key) {
-                continue;
+            let (identity, address) = identify(&adapter, &info);
+            if let Some(identity) = identity {
+                if seen.contains(&identity) {
+                    continue;
+                }
+                seen.push(identity);
             }
-            seen.push(key);
             let slot = GpuSlot {
                 name: info.name,
                 vendor: info.vendor,
-                address: PciAddress::parse(&info.device_pci_bus_id),
+                address,
                 integrated: info.device_type == wgpu::DeviceType::IntegratedGpu,
                 mode: ModeCell::new(),
                 error: std::sync::Mutex::new(None),
@@ -127,6 +127,37 @@ pub fn discover() -> Vec<(wgpu::Adapter, GpuSlot)> {
         found
     })
     .unwrap_or_default()
+}
+
+/// A string that is the same for two listings of one physical card and
+/// different for two cards (None if the system offers nothing reliable),
+/// plus the card's PCI address where known.
+#[cfg(windows)]
+fn identify(adapter: &wgpu::Adapter, _info: &wgpu::AdapterInfo) -> (Option<String>, Option<PciAddress>) {
+    // The bus id wgpu reports on Windows is looked up by card model, so two
+    // identical cards would get the same one. Ask Windows for the adapter's
+    // unique id instead and resolve the address from that.
+    let luid = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() }
+        .and_then(|hal| unsafe { hal.raw_adapter().GetDesc1() }.ok())
+        .map(|desc| (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart));
+    let Some((low, high)) = luid else {
+        return (None, None);
+    };
+    let address = crate::winsensor::adapter_address(low, high).map(|(bus, device, function)| {
+        PciAddress {
+            domain: 0,
+            bus,
+            device,
+            function,
+        }
+    });
+    (Some(format!("{high:x}:{low:x}")), address)
+}
+
+#[cfg(not(windows))]
+fn identify(_adapter: &wgpu::Adapter, info: &wgpu::AdapterInfo) -> (Option<String>, Option<PciAddress>) {
+    let address = PciAddress::parse(&info.device_pci_bus_id);
+    (address.map(|_| info.device_pci_bus_id.clone()), address)
 }
 
 /// Start the load thread for the card at `index` in `shared.gpus`.

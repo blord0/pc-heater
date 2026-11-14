@@ -180,14 +180,17 @@ enum GpuSensor {
 }
 
 impl GpuSensor {
-    /// Find the sensor belonging to `slots[index]`, by PCI address where
-    /// known and otherwise by its position among cards of the same vendor.
+    /// Find the sensor belonging to `slots[index]` by PCI address. Without
+    /// a matching address the pairing is only made when it cannot be wrong:
+    /// one card of that vendor here and one on the sensor side. Lists from
+    /// different sources are ordered differently, so position is no guide.
     fn find(nvml: Option<&Nvml>, slots: &[GpuSlot], index: usize) -> Self {
         let slot = &slots[index];
-        let ordinal = slots[..index]
+        let only_of_vendor = slots
             .iter()
             .filter(|other| other.vendor == slot.vendor)
-            .count();
+            .count()
+            == 1;
 
         if slot.vendor == VENDOR_NVIDIA
             && let Some(nvml) = nvml
@@ -200,14 +203,14 @@ impl GpuSensor {
                         .is_ok_and(|pci| pci.bus == address.bus && pci.device == address.device)
                 })
             });
-            if let Some(i) = by_address.or(((ordinal as u32) < count).then_some(ordinal as u32)) {
+            if let Some(i) = by_address.or((only_of_vendor && count == 1).then_some(0)) {
                 return Self::Nvidia(i);
             }
         }
         #[cfg(windows)]
         if slot.vendor == crate::shared::VENDOR_AMD {
             let address = slot.address.map(|address| (address.bus, address.device));
-            if let Some(gpu) = crate::winsensor::AmdGpu::open(address, ordinal) {
+            if let Some(gpu) = crate::winsensor::AmdGpu::open(address, only_of_vendor) {
                 return Self::Amd(gpu);
             }
         }
@@ -254,6 +257,8 @@ struct Sensors {
     /// Which card, if any, is the Intel graphics built into the processor.
     /// Its power is part of the CPU package figure and gets split out.
     builtin_gpu: Option<usize>,
+    /// Per card: whether it is built into the processor.
+    integrated: Vec<bool>,
     #[cfg(windows)]
     graphics_energy: EnergyCounter,
 }
@@ -265,9 +270,16 @@ impl Sensors {
             .map(|index| GpuSensor::find(nvml.as_ref(), slots, index))
             .collect();
         Self {
-            components: Components::new_with_refreshed_list().ok(),
+            // On Windows the CPU temperature only ever comes from the
+            // driver; the system's generic thermal zones are never used.
+            components: if cfg!(windows) {
+                None
+            } else {
+                Components::new_with_refreshed_list().ok()
+            },
             nvml,
             gpus,
+            integrated: slots.iter().map(|slot| slot.integrated).collect(),
             builtin_gpu: slots
                 .iter()
                 .position(|slot| slot.integrated && slot.vendor == VENDOR_INTEL),
@@ -289,12 +301,13 @@ impl Sensors {
     }
 
     fn read(&mut self) -> Sample {
-        if let Some(components) = &mut self.components {
-            components.refresh(false);
-        }
-        let cpu_temp = self
-            .driver_cpu_temp()
-            .or_else(|| self.component_temp(CPU_PACKAGE_LABELS, CPU_FALLBACK_LABELS));
+        let cpu_temp = self.driver_cpu_temp().or_else(|| {
+            // Only re-read the system's sensors when they are needed.
+            if let Some(components) = &mut self.components {
+                components.refresh(false);
+            }
+            self.component_temp(CPU_PACKAGE_LABELS, CPU_FALLBACK_LABELS)
+        });
         let mut gpus: Vec<_> = self
             .gpus
             .iter()
@@ -303,11 +316,21 @@ impl Sensors {
         let mut cpu_power = self.cpu_power();
         // The package figure includes the built-in graphics. Where the chip
         // reports those separately, move that share to the graphics' own row.
+        let mut split = None;
         if let Some(index) = self.builtin_gpu
             && let Some(graphics) = self.builtin_graphics_power()
         {
             gpus[index].1 = Some(graphics);
             cpu_power = cpu_power.map(|package| (package - graphics).max(0.0));
+            split = Some(index);
+        }
+        // Any other power figure for built-in graphics (AMD's covers the
+        // whole chip) overlaps the CPU figure, so it is dropped rather than
+        // shown and counted twice.
+        for (index, reading) in gpus.iter_mut().enumerate() {
+            if self.integrated[index] && split != Some(index) {
+                reading.1 = None;
+            }
         }
         Sample {
             cpu_temp,

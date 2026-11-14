@@ -67,6 +67,7 @@ pub struct PciAddress {
 
 impl PciAddress {
     /// Parse the usual `0000:01:00.0` form.
+    #[cfg(not(windows))]
     pub fn parse(text: &str) -> Option<Self> {
         let mut parts = text.trim().split(':');
         let (domain, bus, rest) = (parts.next()?, parts.next()?, parts.next()?);

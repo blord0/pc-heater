@@ -19,13 +19,23 @@ use shared::{Mode, ModeCell, Shared};
 use temps::Stats;
 
 const WINDOW_WIDTH: f32 = 440.0;
+/// Internal marker for the copy started when asking for administrator rights.
+#[cfg(windows)]
+use winsensor::RELAUNCHED_FLAG;
+#[cfg(not(windows))]
+const RELAUNCHED_FLAG: &str = "--relaunched";
 const USAGE_REFRESH: Duration = Duration::from_millis(1000);
 
 fn main() -> eframe::Result {
-    let (cpu_mode, gpu_mode) = match parse_args() {
-        Ok(modes) => modes,
+    let args = match parse_args() {
+        Ok(args) => args,
         Err(message) => {
-            eprintln!("{message}\nusage: pc-heater [--cpu off|half|full] [--gpu off|half|full]");
+            let text = format!(
+                "{message}\nusage: pc-heater [--cpu off|half|full] [--gpu off|half|full]"
+            );
+            eprintln!("{text}");
+            #[cfg(windows)]
+            winsensor::error_box(&text);
             std::process::exit(2);
         }
     };
@@ -34,7 +44,8 @@ fn main() -> eframe::Result {
     // always offer to restart elevated. If that is declined, carry on
     // without it.
     #[cfg(windows)]
-    if std::env::var_os("PC_HEATER_NO_ELEVATE").is_none()
+    if !args.relaunched
+        && std::env::var_os("PC_HEATER_NO_ELEVATE").is_none()
         && !winsensor::is_elevated()
         && winsensor::relaunch_elevated()
     {
@@ -43,9 +54,9 @@ fn main() -> eframe::Result {
 
     let (adapters, slots): (Vec<_>, Vec<_>) = gpu::discover().into_iter().unzip();
     let shared = Arc::new(Shared::new(slots));
-    shared.cpu.set(cpu_mode);
+    shared.cpu.set(args.cpu);
     for slot in &shared.gpus {
-        slot.mode.set(gpu_mode);
+        slot.mode.set(args.gpu);
     }
 
     let cpu_threads = cpu::spawn(shared.clone());
@@ -72,22 +83,39 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Optional starting modes for the CPU and for every GPU, from the command
-/// line; both default to Off.
-fn parse_args() -> Result<(Mode, Mode), String> {
-    let (mut cpu, mut gpu) = (Mode::Off, Mode::Off);
+struct Args {
+    /// Starting mode for the CPU.
+    cpu: Mode,
+    /// Starting mode for every GPU.
+    gpu: Mode,
+    /// This copy was started by the request for administrator rights, so
+    /// it must not ask again.
+    relaunched: bool,
+}
+
+/// Read the command line. Both modes default to Off.
+fn parse_args() -> Result<Args, String> {
+    let mut parsed = Args {
+        cpu: Mode::Off,
+        gpu: Mode::Off,
+        relaunched: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let target = match flag.as_str() {
-            "--cpu" => &mut cpu,
-            "--gpu" => &mut gpu,
+            "--cpu" => &mut parsed.cpu,
+            "--gpu" => &mut parsed.gpu,
+            RELAUNCHED_FLAG => {
+                parsed.relaunched = true;
+                continue;
+            }
             other => return Err(format!("unknown option '{other}'")),
         };
         let value = args.next().unwrap_or_default();
         *target = Mode::parse(&value)
             .ok_or_else(|| format!("'{flag}' needs one of: off, half, full"))?;
     }
-    Ok((cpu, gpu))
+    Ok(parsed)
 }
 
 struct HeaterApp {
@@ -188,7 +216,11 @@ impl eframe::App for HeaterApp {
                 readout(
                     ui,
                     &format!("gpu_readout_{index}"),
-                    (&stats.power, None),
+                    // Built-in graphics draw from the processor's own supply.
+                    (
+                        &stats.power,
+                        slot.integrated.then_some("counted in the CPU figure"),
+                    ),
                     // Graphics built into the processor have no sensor of
                     // their own; the CPU temperature already covers them.
                     (!slot.integrated).then_some((&stats.temp, None)),

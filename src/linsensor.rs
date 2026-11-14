@@ -92,27 +92,25 @@ impl CpuPower {
     /// Draw of the processors' built-in graphics in watts, which is part of
     /// what `watts` reports.
     pub fn graphics_watts(&mut self) -> Option<f32> {
-        let mut total = None;
-        for zone in &mut self.graphics {
-            let raw = read_number(&zone.energy_path).ok()?;
-            if let Some(watts) = zone.counter.watts(raw, zone.wrap, 1e-6) {
-                total = Some(total.unwrap_or(0.0) + watts);
-            }
-        }
-        total
+        sum_watts(&mut self.graphics)
     }
 
     /// Total draw of all CPU packages in watts.
     pub fn watts(&mut self) -> Option<f32> {
-        let mut total = None;
-        for zone in &mut self.zones {
-            let raw = read_number(&zone.energy_path).ok()?;
-            if let Some(watts) = zone.counter.watts(raw, zone.wrap, 1e-6) {
-                total = Some(total.unwrap_or(0.0) + watts);
-            }
-        }
-        total
+        sum_watts(&mut self.zones)
     }
+}
+
+/// Combined draw of the given zones in watts.
+fn sum_watts(zones: &mut [RaplZone]) -> Option<f32> {
+    let mut total = None;
+    for zone in zones {
+        let raw = read_number(&zone.energy_path).ok()?;
+        if let Some(watts) = zone.counter.watts(raw, zone.wrap, 1e-6) {
+            total = Some(total.unwrap_or(0.0) + watts);
+        }
+    }
+    total
 }
 
 /// The kernel's hardware sensors for one graphics card (amdgpu, Intel Arc,

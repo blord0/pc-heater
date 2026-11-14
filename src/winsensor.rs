@@ -109,6 +109,65 @@ pub fn is_elevated() -> bool {
     }
 }
 
+/// Command-line marker given to the copy started by `relaunch_elevated`.
+pub const RELAUNCHED_FLAG: &str = "--relaunched";
+
+/// Show an error in a dialog. Release builds have no console to print to.
+pub fn error_box(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    unsafe {
+        MessageBoxW(
+            null_mut(),
+            wide(text).as_ptr(),
+            wide("PC Heater").as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+/// PCI bus, device and function of the display adapter with the given
+/// unique id (LUID), as Windows itself records them.
+pub fn adapter_address(luid_low: u32, luid_high: i32) -> Option<(u32, u32, u32)> {
+    use windows_sys::Wdk::Graphics::Direct3D::{
+        D3DKMT_ADAPTERADDRESS, D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID,
+        D3DKMT_QUERYADAPTERINFO, D3DKMTCloseAdapter, D3DKMTOpenAdapterFromLuid,
+        D3DKMTQueryAdapterInfo, KMTQAITYPE_ADAPTERADDRESS,
+    };
+    use windows_sys::Win32::Foundation::LUID;
+    unsafe {
+        let mut open = D3DKMT_OPENADAPTERFROMLUID {
+            AdapterLuid: LUID {
+                LowPart: luid_low,
+                HighPart: luid_high,
+            },
+            hAdapter: 0,
+        };
+        if D3DKMTOpenAdapterFromLuid(&mut open) < 0 {
+            return None;
+        }
+        let mut address = D3DKMT_ADAPTERADDRESS {
+            BusNumber: 0,
+            DeviceNumber: 0,
+            FunctionNumber: 0,
+        };
+        let mut query = D3DKMT_QUERYADAPTERINFO {
+            hAdapter: open.hAdapter,
+            Type: KMTQAITYPE_ADAPTERADDRESS,
+            pPrivateDriverData: (&raw mut address).cast(),
+            PrivateDriverDataSize: size_of::<D3DKMT_ADAPTERADDRESS>() as u32,
+        };
+        let status = D3DKMTQueryAdapterInfo(&mut query);
+        D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
+            hAdapter: open.hAdapter,
+        });
+        (status >= 0).then_some((
+            address.BusNumber,
+            address.DeviceNumber,
+            address.FunctionNumber,
+        ))
+    }
+}
+
 /// Ask Windows to start another copy of this program as administrator,
 /// passing the same arguments. Returns true if that copy was started (the
 /// caller should then exit); false if the user declined or it failed.
@@ -117,8 +176,12 @@ pub fn relaunch_elevated() -> bool {
         return false;
     };
     let exe: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    // The marker stops the new copy from ever relaunching again, which
+    // would loop forever where "run as administrator" doesn't elevate.
     let args = std::env::args()
         .skip(1)
+        .filter(|a| a != RELAUNCHED_FLAG)
+        .chain(std::iter::once(RELAUNCHED_FLAG.to_owned()))
         .map(|a| format!("\"{}\"", a.replace('"', "")))
         .collect::<Vec<_>>()
         .join(" ");
@@ -447,9 +510,10 @@ pub struct AmdGpu {
 unsafe impl Send for AmdGpu {}
 
 impl AmdGpu {
-    /// Open the AMD card at the given PCI bus and device number, or, when
-    /// that is unknown, the `ordinal`-th AMD card.
-    pub fn open(address: Option<(u32, u32)>, ordinal: usize) -> Option<Self> {
+    /// Open the AMD card at the given PCI bus and device number. If that
+    /// finds nothing and `only_card` says the machine has a single AMD card,
+    /// the driver's single card is used.
+    pub fn open(address: Option<(u32, u32)>, only_card: bool) -> Option<Self> {
         unsafe {
             let library = LoadLibraryExW(
                 wide("atiadlxx.dll").as_ptr(),
@@ -509,7 +573,8 @@ impl AmdGpu {
             }
             let by_address =
                 address.and_then(|wanted| cards.iter().find(|(location, _)| *location == wanted));
-            let (_, indices) = by_address.or_else(|| cards.get(ordinal))?;
+            let lone = (only_card && cards.len() == 1).then(|| &cards[0]);
+            let (_, indices) = by_address.or(lone)?;
             // Use the first of the card's entries that gives a reading.
             for &index in indices {
                 gpu.adapter = index;
