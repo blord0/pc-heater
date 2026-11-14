@@ -4,6 +4,8 @@ mod cpu;
 mod gpu;
 mod shared;
 mod temps;
+#[cfg(windows)]
+mod winsensor;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,6 +25,15 @@ fn main() -> eframe::Result {
         eprintln!("{message}\nusage: pc-heater [--cpu off|half|full] [--gpu off|half|full]");
         std::process::exit(2);
     }
+
+    // Reading the CPU temperature on Windows needs administrator rights, so
+    // always offer to restart elevated. If that is declined, carry on
+    // without it.
+    #[cfg(windows)]
+    if !winsensor::is_elevated() && winsensor::relaunch_elevated() {
+        return Ok(());
+    }
+
     let cpu_threads = cpu::spawn(shared.clone());
     gpu::spawn(shared.clone());
     temps::spawn(shared.clone());
@@ -114,7 +125,7 @@ impl eframe::App for HeaterApp {
             } else {
                 ui.weak(format!("{} threads", self.cpu_threads));
             }
-            temp_readout(ui, "cpu_temps", &temps.cpu);
+            temp_readout(ui, "cpu_temps", &temps.cpu, temps.cpu_hint);
 
             ui.add_space(4.0);
             ui.separator();
@@ -137,7 +148,7 @@ impl eframe::App for HeaterApp {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
             }
-            temp_readout(ui, "gpu_temps", &temps.gpu);
+            temp_readout(ui, "gpu_temps", &temps.gpu, None);
 
             // Keep the window exactly tall enough for everything above.
             // The cursor sits just below the last widget; the panel itself
@@ -170,9 +181,12 @@ fn mode_selector(ui: &mut egui::Ui, cell: &ModeCell, enabled: bool) {
     });
 }
 
-fn temp_readout(ui: &mut egui::Ui, id: &str, stats: &TempStats) {
+fn temp_readout(ui: &mut egui::Ui, id: &str, stats: &TempStats, hint: Option<&str>) {
     if !stats.has_data() {
-        ui.weak("Temperature: no sensor found");
+        match hint {
+            Some(hint) => ui.weak(format!("Temperature: no sensor found ({hint})")),
+            None => ui.weak("Temperature: no sensor found"),
+        };
         return;
     }
     let now = stats

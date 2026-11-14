@@ -65,6 +65,8 @@ impl TempStats {
 pub struct Temps {
     pub cpu: TempStats,
     pub gpu: TempStats,
+    /// What the user can do to get a CPU reading, when there is none.
+    pub cpu_hint: Option<&'static str>,
 }
 
 pub fn spawn(shared: Arc<Shared>) {
@@ -72,7 +74,27 @@ pub fn spawn(shared: Arc<Shared>) {
         .name("temp-monitor".into())
         .spawn(move || {
             let mut sensors = Sensors::new();
+            shared.temps.lock().unwrap().cpu_hint = sensors.cpu_hint();
+
+            // Running as administrator without the driver: install it in the
+            // background and pick it up as soon as that finishes.
+            #[cfg(windows)]
+            let mut installing = {
+                use crate::winsensor::{driver_installed, install_driver, is_elevated};
+                (is_elevated() && !driver_installed()).then(|| {
+                    shared.temps.lock().unwrap().cpu_hint = Some("installing PawnIO driver…");
+                    thread::spawn(install_driver)
+                })
+            };
+
             loop {
+                #[cfg(windows)]
+                if installing.as_ref().is_some_and(|job| job.is_finished()) {
+                    installing = None;
+                    sensors.driver_cpu = crate::winsensor::CpuSensor::open();
+                    shared.temps.lock().unwrap().cpu_hint = sensors.cpu_hint();
+                }
+
                 let (cpu, gpu) = sensors.read();
                 {
                     let mut temps = shared.temps.lock().unwrap();
@@ -88,6 +110,10 @@ pub fn spawn(shared: Arc<Shared>) {
 struct Sensors {
     components: Option<Components>,
     nvml: Option<Nvml>,
+    #[cfg(windows)]
+    driver_cpu: Option<crate::winsensor::CpuSensor>,
+    #[cfg(windows)]
+    amd_gpu: Option<crate::winsensor::AmdGpu>,
 }
 
 impl Sensors {
@@ -95,6 +121,10 @@ impl Sensors {
         Self {
             components: Components::new_with_refreshed_list().ok(),
             nvml: Nvml::init().ok(),
+            #[cfg(windows)]
+            driver_cpu: crate::winsensor::CpuSensor::open(),
+            #[cfg(windows)]
+            amd_gpu: crate::winsensor::AmdGpu::open(),
         }
     }
 
@@ -102,11 +132,54 @@ impl Sensors {
         if let Some(components) = &mut self.components {
             components.refresh(false);
         }
-        let cpu = self.component_temp(CPU_PACKAGE_LABELS, CPU_FALLBACK_LABELS);
+        let cpu = self
+            .driver_cpu_temp()
+            .or_else(|| self.component_temp(CPU_PACKAGE_LABELS, CPU_FALLBACK_LABELS));
         let gpu = self
             .nvidia_temp()
+            .or_else(|| self.amd_gpu_temp())
             .or_else(|| self.component_temp(GPU_LABELS, &[]));
         (cpu, gpu)
+    }
+
+    /// What the user can do to get a CPU reading, when there is none.
+    #[cfg(windows)]
+    fn cpu_hint(&self) -> Option<&'static str> {
+        use crate::winsensor::{driver_installed, is_elevated};
+        if self.driver_cpu.is_some() {
+            None
+        } else if !is_elevated() {
+            Some("needs administrator")
+        } else if !driver_installed() {
+            Some("PawnIO driver install failed")
+        } else {
+            Some("CPU not supported")
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn cpu_hint(&self) -> Option<&'static str> {
+        None
+    }
+
+    #[cfg(windows)]
+    fn driver_cpu_temp(&self) -> Option<f32> {
+        self.driver_cpu.as_ref()?.read()
+    }
+
+    #[cfg(not(windows))]
+    fn driver_cpu_temp(&self) -> Option<f32> {
+        None
+    }
+
+    #[cfg(windows)]
+    fn amd_gpu_temp(&self) -> Option<f32> {
+        self.amd_gpu.as_ref()?.read()
+    }
+
+    #[cfg(not(windows))]
+    fn amd_gpu_temp(&self) -> Option<f32> {
+        None
     }
 
     fn nvidia_temp(&self) -> Option<f32> {
@@ -136,7 +209,9 @@ impl Sensors {
 
 /// Whole-package CPU sensors: Intel coretemp, AMD k10temp/zenpower.
 const CPU_PACKAGE_LABELS: &[&str] = &["package", "tctl", "tdie"];
-/// Per-core sensors and the generic ACPI thermal zones Windows exposes.
-const CPU_FALLBACK_LABELS: &[&str] = &["coretemp", "k10temp", "zenpower", "cpu", "core", "thermal", "acpi"];
-/// Non-NVIDIA GPUs that report through the kernel's hardware sensors.
-const GPU_LABELS: &[&str] = &["amdgpu", "radeon", "nouveau", "gpu"];
+/// Per-core sensors. Generic ACPI thermal zones are deliberately left out:
+/// on many desktop boards they report a fixed value unrelated to the CPU.
+const CPU_FALLBACK_LABELS: &[&str] = &["coretemp", "k10temp", "zenpower", "cpu", "core"];
+/// Non-NVIDIA GPUs that report through the kernel's hardware sensors on
+/// Linux: AMD (amdgpu/radeon), Intel Arc (i915/xe) and nouveau.
+const GPU_LABELS: &[&str] = &["amdgpu", "radeon", "i915", "xe ", "nouveau", "gpu"];

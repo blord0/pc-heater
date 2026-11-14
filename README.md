@@ -33,6 +33,25 @@ Both start at Off unless given on the command line.
 
 - The GPU load runs through Vulkan on Linux and DirectX 12 on Windows, so it
   works on any vendor's card.
-- GPU temperature is read through the NVIDIA driver, or the kernel's hardware
-  sensors for other cards on Linux. CPU temperature on Windows depends on what
-  the firmware exposes and may be unavailable.
+- Temperature sources:
+
+  |            | Linux                         | Windows                          |
+  |------------|-------------------------------|----------------------------------|
+  | Intel CPU  | kernel sensors (coretemp)     | PawnIO driver, as administrator  |
+  | AMD CPU    | kernel sensors (k10temp)      | PawnIO driver, as administrator (Zen and later) |
+  | NVIDIA GPU | NVIDIA driver                 | NVIDIA driver                    |
+  | AMD GPU    | kernel sensors (amdgpu)       | Radeon driver                    |
+  | Intel GPU  | kernel sensors (Arc only)     | not available                    |
+
+- Windows has no built-in way to read CPU temperatures, so pc-heater uses the
+  [PawnIO](https://github.com/namazso/PawnIO) driver. It asks for
+  administrator rights every time it starts; when it has them and the driver
+  is missing, it installs it automatically with
+  `winget install namazso.PawnIO`. If you decline the prompt, everything else
+  still works and the CPU temperature shows "no sensor found".
+
+## Third-party components
+
+`assets/pawnio/*.bin` are prebuilt, signed modules from
+[PawnIO.Modules](https://github.com/namazso/PawnIO.Modules), licensed under
+the LGPL 2.1 or later (see `assets/pawnio/COPYING`).
