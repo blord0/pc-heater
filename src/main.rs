@@ -1,0 +1,184 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod cpu;
+mod gpu;
+mod shared;
+mod temps;
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+use sysinfo::System;
+
+use shared::{GpuState, Mode, ModeCell, Shared};
+use temps::TempStats;
+
+const USAGE_REFRESH: Duration = Duration::from_millis(1000);
+
+fn main() -> eframe::Result {
+    let shared = Arc::new(Shared::new());
+    if let Err(message) = apply_args(&shared) {
+        eprintln!("{message}\nusage: pc-heater [--cpu off|half|full] [--gpu off|half|full]");
+        std::process::exit(2);
+    }
+    let cpu_threads = cpu::spawn(shared.clone());
+    gpu::spawn(shared.clone());
+    temps::spawn(shared.clone());
+
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("bundled icon is a valid PNG");
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("PC Heater")
+            .with_app_id("pc-heater")
+            .with_icon(icon)
+            .with_inner_size([380.0, 330.0])
+            .with_resizable(false),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "pc-heater",
+        options,
+        Box::new(move |_cc| Ok(Box::new(HeaterApp::new(shared, cpu_threads)))),
+    )
+}
+
+/// Optional starting modes from the command line; both default to Off.
+fn apply_args(shared: &Shared) -> Result<(), String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let cell = match flag.as_str() {
+            "--cpu" => &shared.cpu,
+            "--gpu" => &shared.gpu,
+            other => return Err(format!("unknown option '{other}'")),
+        };
+        let value = args.next().unwrap_or_default();
+        let mode = Mode::parse(&value)
+            .ok_or_else(|| format!("'{flag}' needs one of: off, half, full"))?;
+        cell.set(mode);
+    }
+    Ok(())
+}
+
+struct HeaterApp {
+    shared: Arc<Shared>,
+    cpu_threads: usize,
+    system: Option<System>,
+    cpu_usage: f32,
+    last_refresh: Instant,
+}
+
+impl HeaterApp {
+    fn new(shared: Arc<Shared>, cpu_threads: usize) -> Self {
+        let mut system = System::new().ok();
+        if let Some(system) = &mut system {
+            system.refresh_cpu_usage();
+        }
+        Self {
+            shared,
+            cpu_threads,
+            system,
+            cpu_usage: 0.0,
+            last_refresh: Instant::now(),
+        }
+    }
+}
+
+impl eframe::App for HeaterApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.last_refresh.elapsed() >= USAGE_REFRESH {
+            if let Some(system) = &mut self.system {
+                system.refresh_cpu_usage();
+                self.cpu_usage = system.global_cpu_usage();
+            }
+            self.last_refresh = Instant::now();
+        }
+        ui.ctx().request_repaint_after(USAGE_REFRESH);
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            let temps = self.shared.temps.lock().unwrap();
+
+            ui.heading("CPU");
+            mode_selector(ui, &self.shared.cpu, true);
+            if self.system.is_some() {
+                ui.weak(format!(
+                    "{} threads · {:.0}% total usage",
+                    self.cpu_threads, self.cpu_usage
+                ));
+            } else {
+                ui.weak(format!("{} threads", self.cpu_threads));
+            }
+            temp_readout(ui, "cpu_temps", &temps.cpu);
+
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.heading("GPU");
+            let state = self.shared.gpu_state.lock().unwrap();
+            match &*state {
+                GpuState::Starting => {
+                    mode_selector(ui, &self.shared.gpu, false);
+                    ui.weak("Starting…");
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                }
+                GpuState::Ready(name) => {
+                    mode_selector(ui, &self.shared.gpu, true);
+                    ui.weak(name);
+                }
+                GpuState::Failed(error) => {
+                    mode_selector(ui, &self.shared.gpu, false);
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            }
+            temp_readout(ui, "gpu_temps", &temps.gpu);
+        });
+    }
+}
+
+fn mode_selector(ui: &mut egui::Ui, cell: &ModeCell, enabled: bool) {
+    let current = cell.get();
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            for mode in Mode::ALL {
+                let text = egui::RichText::new(mode.label()).size(18.0);
+                let button = egui::Button::selectable(current == mode, text)
+                    .min_size(egui::vec2(100.0, 34.0));
+                if ui.add(button).clicked() {
+                    cell.set(mode);
+                }
+            }
+        });
+    });
+}
+
+fn temp_readout(ui: &mut egui::Ui, id: &str, stats: &TempStats) {
+    if !stats.has_data() {
+        ui.weak("Temperature: no sensor found");
+        return;
+    }
+    let now = stats
+        .current
+        .map_or_else(|| "–".to_owned(), |t| format!("{t:.0} °C"));
+    let cells = [
+        ("Now", now),
+        ("Min", format!("{:.0} °C", stats.min)),
+        ("Max", format!("{:.0} °C", stats.max)),
+        ("Avg (total)", format!("{:.1} °C", stats.avg_total())),
+        ("Avg (5 min)", format!("{:.1} °C", stats.avg_recent())),
+    ];
+    egui::Grid::new(id)
+        .spacing([18.0, 2.0])
+        .show(ui, |ui| {
+            for (title, _) in &cells {
+                ui.weak(*title);
+            }
+            ui.end_row();
+            for (_, value) in &cells {
+                ui.strong(value);
+            }
+            ui.end_row();
+        });
+}
