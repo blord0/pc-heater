@@ -220,6 +220,8 @@ const MSR_TEMPERATURE_TARGET: u64 = 0x1A2;
 const MSR_PACKAGE_THERM_STATUS: u64 = 0x1B1;
 const MSR_RAPL_POWER_UNIT: u64 = 0x606;
 const MSR_PKG_ENERGY_STATUS: u64 = 0x611;
+/// Energy used by the built-in graphics alone ("PP1" on desktop and laptop chips).
+const MSR_PP1_ENERGY_STATUS: u64 = 0x641;
 const MSR_AMD_RAPL_POWER_UNIT: u64 = 0xC001_0299;
 const MSR_AMD_PKG_ENERGY_STATUS: u64 = 0xC001_029B;
 
@@ -299,6 +301,22 @@ impl CpuSensor {
         };
         let raw = io.call("ioctl_read_msr", msr)? & 0xFFFF_FFFF;
         Some((raw, (*unit)?))
+    }
+
+    /// The energy counter of the processor's built-in graphics, in the same
+    /// form as `energy`. Intel only; None where the chip doesn't report it.
+    pub fn graphics_energy(&self) -> Option<(u64, f64)> {
+        let Self::Intel {
+            io,
+            joules_per_unit,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let raw = io.call("ioctl_read_msr", MSR_PP1_ENERGY_STATUS)? & 0xFFFF_FFFF;
+        // A counter stuck at zero means the chip doesn't track this.
+        (raw != 0).then_some((raw, (*joules_per_unit)?))
     }
 
     /// Temperature in °C: package for Intel, Tctl for AMD.

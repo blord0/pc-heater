@@ -51,6 +51,7 @@ impl ModeCell {
 }
 
 pub const VENDOR_NVIDIA: u32 = 0x10DE;
+pub const VENDOR_INTEL: u32 = 0x8086;
 #[cfg(windows)]
 pub const VENDOR_AMD: u32 = 0x1002;
 
@@ -86,6 +87,8 @@ pub struct GpuSlot {
     /// PCI vendor ID.
     pub vendor: u32,
     pub address: Option<PciAddress>,
+    /// Built into the processor rather than a separate card.
+    pub integrated: bool,
     pub mode: ModeCell,
     /// Set if the card's load could not be started or stopped working.
     pub error: Mutex<Option<String>>,

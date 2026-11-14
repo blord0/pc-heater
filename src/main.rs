@@ -98,6 +98,8 @@ struct HeaterApp {
     last_refresh: Instant,
     /// Window height last requested to fit the content.
     fitted_height: f32,
+    /// Window title last set, so it is only changed when the total does.
+    title: String,
 }
 
 impl HeaterApp {
@@ -113,6 +115,7 @@ impl HeaterApp {
             cpu_usage: 0.0,
             last_refresh: Instant::now(),
             fitted_height: 0.0,
+            title: String::new(),
         }
     }
 }
@@ -132,6 +135,21 @@ impl eframe::App for HeaterApp {
             ui.spacing_mut().item_spacing.y = 8.0;
             let temps = self.shared.temps.lock().unwrap();
 
+            // Show the combined draw of everything with a power reading in
+            // the title bar.
+            let readings = std::iter::once(&temps.cpu_power)
+                .chain(temps.gpus.iter().map(|gpu| &gpu.power))
+                .filter_map(|stats| stats.current);
+            let title = match readings.reduce(|total, watts| total + watts) {
+                Some(total) => format!("PC Heater – {total:.0} W"),
+                None => "PC Heater".to_owned(),
+            };
+            if title != self.title {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+                self.title = title;
+            }
+
             ui.heading("CPU");
             mode_selector(ui, &self.shared.cpu, true);
             if self.system.is_some() {
@@ -146,7 +164,7 @@ impl eframe::App for HeaterApp {
                 ui,
                 "cpu_readout",
                 (&temps.cpu_power, temps.cpu_power_hint),
-                (&temps.cpu, temps.cpu_hint),
+                Some((&temps.cpu, temps.cpu_hint)),
             );
 
             if self.shared.gpus.is_empty() {
@@ -171,7 +189,9 @@ impl eframe::App for HeaterApp {
                     ui,
                     &format!("gpu_readout_{index}"),
                     (&stats.power, None),
-                    (&stats.temp, None),
+                    // Graphics built into the processor have no sensor of
+                    // their own; the CPU temperature already covers them.
+                    (!slot.integrated).then_some((&stats.temp, None)),
                 );
             }
 
@@ -212,14 +232,18 @@ fn mode_selector(ui: &mut egui::Ui, cell: &ModeCell, enabled: bool) {
     });
 }
 
-/// Power and temperature statistics for one device, as an aligned table.
+/// Power and (where the device has one) temperature statistics for one
+/// device, as an aligned table.
 fn readout(
     ui: &mut egui::Ui,
     id: &str,
     power: (&Stats, Option<&str>),
-    temp: (&Stats, Option<&str>),
+    temp: Option<(&Stats, Option<&str>)>,
 ) {
-    let rows = [("Power", "W", power), ("Temp", "°C", temp)];
+    let mut rows = vec![("Power", "W", power)];
+    if let Some(temp) = temp {
+        rows.push(("Temp", "°C", temp));
+    }
     egui::Grid::new(id).spacing([18.0, 4.0]).show(ui, |ui| {
         for title in ["", "Now", "Min", "Max", "Avg (total)", "Avg (5 min)"] {
             ui.weak(title);

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::wgpu;
 
-use crate::shared::{GpuSlot, Mode, ModeCell, PciAddress, Shared, lower_thread_priority};
+use crate::shared::{GpuSlot, Mode, ModeCell, PciAddress, Shared};
 
 /// Side length of the off-screen image the load draws into.
 const TARGET_SIZE: u32 = 2048;
@@ -74,31 +74,37 @@ pub fn discover() -> Vec<(wgpu::Adapter, GpuSlot)> {
         let instance = wgpu::Instance::default();
         let mut adapters =
             pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY));
-        // A card can show up once per graphics API. Keep the native one:
-        // DirectX 12 on Windows, Vulkan elsewhere.
-        let preferred = if cfg!(windows) {
+        // Software renderers would just be a second CPU load.
+        adapters.retain(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu);
+
+        // Each graphics API lists the same cards again, and they don't
+        // describe them identically, so take the cards from one API only:
+        // the native one (DirectX 12 on Windows, Vulkan elsewhere) if it
+        // found any, otherwise whichever did.
+        let native = if cfg!(windows) {
             wgpu::Backend::Dx12
         } else {
             wgpu::Backend::Vulkan
         };
-        adapters.sort_by_key(|adapter| {
-            let info = adapter.get_info();
-            let kind = match info.device_type {
-                wgpu::DeviceType::DiscreteGpu => 0,
-                wgpu::DeviceType::IntegratedGpu => 1,
-                _ => 2,
-            };
-            (kind, info.backend != preferred)
+        let has_native = adapters.iter().any(|a| a.get_info().backend == native);
+        let backend = if has_native {
+            Some(native)
+        } else {
+            adapters.first().map(|a| a.get_info().backend)
+        };
+        adapters.retain(|adapter| Some(adapter.get_info().backend) == backend);
+
+        adapters.sort_by_key(|adapter| match adapter.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            _ => 2,
         });
 
+        // Even one API can list a card more than once.
         let mut seen = Vec::new();
         let mut found = Vec::new();
         for adapter in adapters {
             let info = adapter.get_info();
-            // Software renderers would just be a second CPU load.
-            if info.device_type == wgpu::DeviceType::Cpu {
-                continue;
-            }
             let key = if info.device_pci_bus_id.is_empty() {
                 format!("{:x}:{:x}:{}", info.vendor, info.device, info.name)
             } else {
@@ -112,6 +118,7 @@ pub fn discover() -> Vec<(wgpu::Adapter, GpuSlot)> {
                 name: info.name,
                 vendor: info.vendor,
                 address: PciAddress::parse(&info.device_pci_bus_id),
+                integrated: info.device_type == wgpu::DeviceType::IntegratedGpu,
                 mode: ModeCell::new(),
                 error: std::sync::Mutex::new(None),
             };
@@ -141,7 +148,9 @@ pub fn spawn(shared: Arc<Shared>, index: usize, adapter: wgpu::Adapter) {
 }
 
 fn run(slot: &GpuSlot, adapter: &wgpu::Adapter) -> Result<(), String> {
-    lower_thread_priority();
+    // This thread stays at normal priority: it only hands work to the card
+    // and waits, but if it ran at the CPU heaters' low priority they would
+    // starve it and the card would sit idle.
     let mut burner = Burner::new(adapter)?;
 
     loop {

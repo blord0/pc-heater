@@ -7,7 +7,7 @@ use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
 use sysinfo::Components;
 
-use crate::shared::{GpuSlot, Shared, VENDOR_NVIDIA};
+use crate::shared::{GpuSlot, Shared, VENDOR_INTEL, VENDOR_NVIDIA};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Samples kept for the rolling average (5 minutes at one per second).
@@ -251,6 +251,11 @@ struct Sensors {
     #[cfg(windows)]
     driver_cpu: Option<crate::winsensor::CpuSensor>,
     gpus: Vec<GpuSensor>,
+    /// Which card, if any, is the Intel graphics built into the processor.
+    /// Its power is part of the CPU package figure and gets split out.
+    builtin_gpu: Option<usize>,
+    #[cfg(windows)]
+    graphics_energy: EnergyCounter,
 }
 
 impl Sensors {
@@ -263,6 +268,11 @@ impl Sensors {
             components: Components::new_with_refreshed_list().ok(),
             nvml,
             gpus,
+            builtin_gpu: slots
+                .iter()
+                .position(|slot| slot.integrated && slot.vendor == VENDOR_INTEL),
+            #[cfg(windows)]
+            graphics_energy: EnergyCounter::default(),
             #[cfg(windows)]
             cpu_energy: EnergyCounter::default(),
             #[cfg(target_os = "linux")]
@@ -285,16 +295,41 @@ impl Sensors {
         let cpu_temp = self
             .driver_cpu_temp()
             .or_else(|| self.component_temp(CPU_PACKAGE_LABELS, CPU_FALLBACK_LABELS));
-        let gpus = self
+        let mut gpus: Vec<_> = self
             .gpus
             .iter()
             .map(|sensor| sensor.read(self.nvml.as_ref()))
             .collect();
+        let mut cpu_power = self.cpu_power();
+        // The package figure includes the built-in graphics. Where the chip
+        // reports those separately, move that share to the graphics' own row.
+        if let Some(index) = self.builtin_gpu
+            && let Some(graphics) = self.builtin_graphics_power()
+        {
+            gpus[index].1 = Some(graphics);
+            cpu_power = cpu_power.map(|package| (package - graphics).max(0.0));
+        }
         Sample {
             cpu_temp,
-            cpu_power: self.cpu_power(),
+            cpu_power,
             gpus,
         }
+    }
+
+    #[cfg(windows)]
+    fn builtin_graphics_power(&mut self) -> Option<f32> {
+        let (raw, joules_per_unit) = self.driver_cpu.as_ref()?.graphics_energy()?;
+        self.graphics_energy.watts(raw, 1 << 32, joules_per_unit)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn builtin_graphics_power(&mut self) -> Option<f32> {
+        self.cpu_power.graphics_watts()
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn builtin_graphics_power(&mut self) -> Option<f32> {
+        None
     }
 
     /// CPU package power in watts, from the processor's energy counter.

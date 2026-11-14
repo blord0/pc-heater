@@ -25,6 +25,9 @@ struct RaplZone {
 
 pub struct CpuPower {
     zones: Vec<RaplZone>,
+    /// The built-in graphics' share of each package ("uncore"), where the
+    /// processor reports it separately.
+    graphics: Vec<RaplZone>,
     /// The counters exist but this user may not read them.
     pub denied: bool,
 }
@@ -32,6 +35,7 @@ pub struct CpuPower {
 impl CpuPower {
     pub fn open() -> Self {
         let mut zones = Vec::new();
+        let mut graphics = Vec::new();
         let mut denied = false;
         let entries = fs::read_dir("/sys/class/powercap")
             .into_iter()
@@ -63,8 +67,39 @@ impl CpuPower {
                 Err(error) if error.kind() == ErrorKind::PermissionDenied => denied = true,
                 Err(_) => {}
             }
+            // Parts of this package are listed inside it as "intel-rapl:N:M".
+            for part in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let part_dir = part.path();
+                let part_name = fs::read_to_string(part_dir.join("name")).unwrap_or_default();
+                let energy_path = part_dir.join("energy_uj");
+                if part_name.trim() == "uncore" && read_number(&energy_path).is_ok() {
+                    graphics.push(RaplZone {
+                        wrap: read_number(&part_dir.join("max_energy_range_uj"))
+                            .unwrap_or(u64::MAX),
+                        energy_path,
+                        counter: EnergyCounter::default(),
+                    });
+                }
+            }
         }
-        Self { zones, denied }
+        Self {
+            zones,
+            graphics,
+            denied,
+        }
+    }
+
+    /// Draw of the processors' built-in graphics in watts, which is part of
+    /// what `watts` reports.
+    pub fn graphics_watts(&mut self) -> Option<f32> {
+        let mut total = None;
+        for zone in &mut self.graphics {
+            let raw = read_number(&zone.energy_path).ok()?;
+            if let Some(watts) = zone.counter.watts(raw, zone.wrap, 1e-6) {
+                total = Some(total.unwrap_or(0.0) + watts);
+            }
+        }
+        total
     }
 
     /// Total draw of all CPU packages in watts.
