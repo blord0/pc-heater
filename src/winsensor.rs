@@ -218,6 +218,10 @@ impl Drop for PawnIo {
 
 const MSR_TEMPERATURE_TARGET: u64 = 0x1A2;
 const MSR_PACKAGE_THERM_STATUS: u64 = 0x1B1;
+const MSR_RAPL_POWER_UNIT: u64 = 0x606;
+const MSR_PKG_ENERGY_STATUS: u64 = 0x611;
+const MSR_AMD_RAPL_POWER_UNIT: u64 = 0xC001_0299;
+const MSR_AMD_PKG_ENERGY_STATUS: u64 = 0xC001_029B;
 
 /// Zen reported-temperature register (same one Linux's k10temp uses).
 const SMN_THM_TCON_CUR_TMP: u64 = 0x0005_9800;
@@ -228,10 +232,24 @@ const PCI_MUTEX: &str = r"Global\Access_PCI";
 /// Access right needed to wait on an existing mutex.
 const SYNCHRONIZE: u32 = 0x0010_0000;
 
-/// CPU package temperature through PawnIO.
+/// CPU package temperature and energy use through PawnIO.
 pub enum CpuSensor {
-    Intel { io: PawnIo, tj_max: f32 },
-    Amd { io: PawnIo, pci_mutex: HANDLE },
+    Intel {
+        io: PawnIo,
+        tj_max: f32,
+        joules_per_unit: Option<f64>,
+    },
+    Amd {
+        io: PawnIo,
+        pci_mutex: HANDLE,
+        joules_per_unit: Option<f64>,
+    },
+}
+
+/// Size of one step of the package energy counter, from the RAPL unit MSR.
+fn energy_unit(io: &PawnIo, unit_msr: u64) -> Option<f64> {
+    let bits = (io.call("ioctl_read_msr", unit_msr)? >> 8) & 0x1F;
+    Some(1.0 / (1u64 << bits) as f64)
 }
 
 // The handles are only ever used from the temperature thread.
@@ -242,7 +260,12 @@ impl CpuSensor {
         if let Some(io) = PawnIo::open(INTEL_MSR_MODULE) {
             let target = (io.call("ioctl_read_msr", MSR_TEMPERATURE_TARGET)? >> 16) & 0xFF;
             let tj_max = if target > 0 { target as f32 } else { 100.0 };
-            return Some(Self::Intel { io, tj_max });
+            let joules_per_unit = energy_unit(&io, MSR_RAPL_POWER_UNIT);
+            return Some(Self::Intel {
+                io,
+                tj_max,
+                joules_per_unit,
+            });
         }
         // Covers Zen and later (families 17h to 1Ah).
         let io = PawnIo::open(AMD_FAMILY17_MODULE)?;
@@ -251,18 +274,42 @@ impl CpuSensor {
         if pci_mutex.is_null() {
             pci_mutex = unsafe { OpenMutexW(SYNCHRONIZE, 0, name.as_ptr()) };
         }
-        Some(Self::Amd { io, pci_mutex })
+        let joules_per_unit = energy_unit(&io, MSR_AMD_RAPL_POWER_UNIT);
+        Some(Self::Amd {
+            io,
+            pci_mutex,
+            joules_per_unit,
+        })
+    }
+
+    /// The package energy counter: its raw 32-bit value and the size of one
+    /// step in joules. It wraps around, so only differences are meaningful.
+    pub fn energy(&self) -> Option<(u64, f64)> {
+        let (io, unit, msr) = match self {
+            Self::Intel {
+                io,
+                joules_per_unit,
+                ..
+            } => (io, joules_per_unit, MSR_PKG_ENERGY_STATUS),
+            Self::Amd {
+                io,
+                joules_per_unit,
+                ..
+            } => (io, joules_per_unit, MSR_AMD_PKG_ENERGY_STATUS),
+        };
+        let raw = io.call("ioctl_read_msr", msr)? & 0xFFFF_FFFF;
+        Some((raw, (*unit)?))
     }
 
     /// Temperature in °C: package for Intel, Tctl for AMD.
     pub fn read(&self) -> Option<f32> {
         match self {
-            Self::Intel { io, tj_max } => {
+            Self::Intel { io, tj_max, .. } => {
                 let status = io.call("ioctl_read_msr", MSR_PACKAGE_THERM_STATUS)?;
                 // Bits 22:16 hold how far below TjMax the package currently is.
                 Some(tj_max - ((status >> 16) & 0x7F) as f32)
             }
-            Self::Amd { io, pci_mutex } => {
+            Self::Amd { io, pci_mutex, .. } => {
                 if !pci_mutex.is_null() {
                     let wait = unsafe { WaitForSingleObject(*pci_mutex, 10) };
                     if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
@@ -302,6 +349,8 @@ const ADL_MAX_PATH: usize = 256;
 const ADL_PMLOG_MAX_SENSORS: usize = 256;
 const ADL_PMLOG_TEMPERATURE_EDGE: usize = 8;
 const ADL_PMLOG_TEMPERATURE_GFX: usize = 28;
+const ADL_PMLOG_ASIC_POWER: usize = 23;
+const ADL_PMLOG_BOARD_POWER: usize = 73;
 const ADL_ODN_TEMPERATURE_EDGE: i32 = 1;
 const AMD_VENDOR_ID: i32 = 0x1002;
 
@@ -440,24 +489,39 @@ impl AmdGpu {
         }
     }
 
+    /// First supported, plausible value among the given driver log sensors.
+    fn pm_log_value(&self, sensors: &[usize], max: f32) -> Option<f32> {
+        let pm_log = self.pm_log?;
+        unsafe {
+            let mut data: AdlPmLogData = std::mem::zeroed();
+            data.size = size_of::<AdlPmLogData>() as i32;
+            if pm_log(self.context, self.adapter, &mut data) != 0 {
+                return None;
+            }
+            sensors
+                .iter()
+                .map(|&index| data.sensors[index])
+                .filter(|sensor| sensor.supported != 0)
+                .map(|sensor| sensor.value as f32)
+                .find(|value| *value > 0.0 && *value < max)
+        }
+    }
+
+    /// Power draw in watts. Only current cards report this.
+    pub fn power(&self) -> Option<f32> {
+        self.pm_log_value(&[ADL_PMLOG_BOARD_POWER, ADL_PMLOG_ASIC_POWER], 2000.0)
+    }
+
     pub fn read(&self) -> Option<f32> {
         let plausible = |celsius: f32| (celsius > 0.0 && celsius < 150.0).then_some(celsius);
+        // Current cards: the driver's sensor log, already in °C.
+        if let Some(celsius) = self.pm_log_value(
+            &[ADL_PMLOG_TEMPERATURE_EDGE, ADL_PMLOG_TEMPERATURE_GFX],
+            150.0,
+        ) {
+            return Some(celsius);
+        }
         unsafe {
-            // Current cards: the driver's sensor log, already in °C.
-            if let Some(pm_log) = self.pm_log {
-                let mut data: AdlPmLogData = std::mem::zeroed();
-                data.size = size_of::<AdlPmLogData>() as i32;
-                if pm_log(self.context, self.adapter, &mut data) == 0 {
-                    for index in [ADL_PMLOG_TEMPERATURE_EDGE, ADL_PMLOG_TEMPERATURE_GFX] {
-                        let sensor = data.sensors[index];
-                        if sensor.supported != 0
-                            && let Some(celsius) = plausible(sensor.value as f32)
-                        {
-                            return Some(celsius);
-                        }
-                    }
-                }
-            }
             // Older cards: Overdrive N, then Overdrive 5, both in millidegrees.
             if let Some(odn_temp) = self.odn_temp {
                 let mut value = 0i32;

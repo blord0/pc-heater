@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::TemperatureSensor;
@@ -13,9 +13,9 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Samples kept for the rolling average (5 minutes at one per second).
 const WINDOW_SAMPLES: usize = 300;
 
-/// Running temperature statistics in °C since the program started.
+/// Running statistics for one reading (°C or watts) since the program started.
 #[derive(Default)]
-pub struct TempStats {
+pub struct Stats {
     pub current: Option<f32>,
     pub min: f32,
     pub max: f32,
@@ -25,7 +25,7 @@ pub struct TempStats {
     window_sum: f64,
 }
 
-impl TempStats {
+impl Stats {
     fn record(&mut self, value: Option<f32>) {
         self.current = value;
         let Some(value) = value else { return };
@@ -63,10 +63,42 @@ impl TempStats {
 
 #[derive(Default)]
 pub struct Temps {
-    pub cpu: TempStats,
-    pub gpu: TempStats,
+    pub cpu: Stats,
+    pub gpu: Stats,
+    pub cpu_power: Stats,
+    pub gpu_power: Stats,
     /// What the user can do to get a CPU reading, when there is none.
     pub cpu_hint: Option<&'static str>,
+    pub cpu_power_hint: Option<&'static str>,
+}
+
+/// Turns a cumulative hardware energy counter into average watts between
+/// successive readings.
+#[derive(Default)]
+pub struct EnergyCounter {
+    last: Option<(u64, Instant)>,
+}
+
+impl EnergyCounter {
+    /// `raw` is the counter value, `wrap` the value at which it rolls over
+    /// to zero, and `joules_per_unit` the size of one counter step.
+    pub fn watts(&mut self, raw: u64, wrap: u64, joules_per_unit: f64) -> Option<f32> {
+        let now = Instant::now();
+        let previous = self.last.replace((raw, now));
+        let (last_raw, last_time) = previous?;
+        let seconds = now.duration_since(last_time).as_secs_f64();
+        if seconds < 0.05 {
+            return None;
+        }
+        let delta = if raw >= last_raw {
+            raw - last_raw
+        } else {
+            raw.wrapping_add(wrap).wrapping_sub(last_raw)
+        };
+        let watts = (delta as f64 * joules_per_unit / seconds) as f32;
+        // A wildly large value means the counter was reset, not real draw.
+        (watts < 5000.0).then_some(watts)
+    }
 }
 
 pub fn spawn(shared: Arc<Shared>) {
@@ -74,7 +106,7 @@ pub fn spawn(shared: Arc<Shared>) {
         .name("temp-monitor".into())
         .spawn(move || {
             let mut sensors = Sensors::new();
-            shared.temps.lock().unwrap().cpu_hint = sensors.cpu_hint();
+            sensors.publish_hints(&shared);
 
             // Running as administrator without the driver: install it in the
             // background and pick it up as soon as that finishes.
@@ -92,14 +124,16 @@ pub fn spawn(shared: Arc<Shared>) {
                 if installing.as_ref().is_some_and(|job| job.is_finished()) {
                     installing = None;
                     sensors.driver_cpu = crate::winsensor::CpuSensor::open();
-                    shared.temps.lock().unwrap().cpu_hint = sensors.cpu_hint();
+                    sensors.publish_hints(&shared);
                 }
 
-                let (cpu, gpu) = sensors.read();
+                let sample = sensors.read();
                 {
                     let mut temps = shared.temps.lock().unwrap();
-                    temps.cpu.record(cpu);
-                    temps.gpu.record(gpu);
+                    temps.cpu.record(sample.cpu_temp);
+                    temps.gpu.record(sample.gpu_temp);
+                    temps.cpu_power.record(sample.cpu_power);
+                    temps.gpu_power.record(sample.gpu_power);
                 }
                 thread::sleep(SAMPLE_INTERVAL);
             }
@@ -107,9 +141,20 @@ pub fn spawn(shared: Arc<Shared>) {
         .expect("failed to spawn temperature monitor");
 }
 
+struct Sample {
+    cpu_temp: Option<f32>,
+    gpu_temp: Option<f32>,
+    cpu_power: Option<f32>,
+    gpu_power: Option<f32>,
+}
+
 struct Sensors {
     components: Option<Components>,
     nvml: Option<Nvml>,
+    #[cfg(windows)]
+    cpu_energy: EnergyCounter,
+    #[cfg(target_os = "linux")]
+    cpu_power: crate::linsensor::CpuPower,
     #[cfg(windows)]
     driver_cpu: Option<crate::winsensor::CpuSensor>,
     #[cfg(windows)]
@@ -122,24 +167,94 @@ impl Sensors {
             components: Components::new_with_refreshed_list().ok(),
             nvml: Nvml::init().ok(),
             #[cfg(windows)]
+            cpu_energy: EnergyCounter::default(),
+            #[cfg(target_os = "linux")]
+            cpu_power: crate::linsensor::CpuPower::open(),
+            #[cfg(windows)]
             driver_cpu: crate::winsensor::CpuSensor::open(),
             #[cfg(windows)]
             amd_gpu: crate::winsensor::AmdGpu::open(),
         }
     }
 
-    fn read(&mut self) -> (Option<f32>, Option<f32>) {
+    fn publish_hints(&self, shared: &Shared) {
+        let mut temps = shared.temps.lock().unwrap();
+        temps.cpu_hint = self.cpu_hint();
+        temps.cpu_power_hint = self.cpu_power_hint();
+    }
+
+    fn read(&mut self) -> Sample {
         if let Some(components) = &mut self.components {
             components.refresh(false);
         }
-        let cpu = self
+        let cpu_temp = self
             .driver_cpu_temp()
             .or_else(|| self.component_temp(CPU_PACKAGE_LABELS, CPU_FALLBACK_LABELS));
-        let gpu = self
+        let gpu_temp = self
             .nvidia_temp()
             .or_else(|| self.amd_gpu_temp())
             .or_else(|| self.component_temp(GPU_LABELS, &[]));
-        (cpu, gpu)
+        let gpu_power = self.nvidia_power().or_else(|| self.other_gpu_power());
+        Sample {
+            cpu_temp,
+            gpu_temp,
+            cpu_power: self.cpu_power(),
+            gpu_power,
+        }
+    }
+
+    fn nvidia_power(&self) -> Option<f32> {
+        let device = self.nvml.as_ref()?.device_by_index(0).ok()?;
+        Some(device.power_usage().ok()? as f32 / 1000.0)
+    }
+
+    #[cfg(windows)]
+    fn other_gpu_power(&self) -> Option<f32> {
+        self.amd_gpu.as_ref()?.power()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn other_gpu_power(&self) -> Option<f32> {
+        crate::linsensor::gpu_watts()
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn other_gpu_power(&self) -> Option<f32> {
+        None
+    }
+
+    /// CPU package power in watts, from the processor's energy counter.
+    #[cfg(windows)]
+    fn cpu_power(&mut self) -> Option<f32> {
+        let (raw, joules_per_unit) = self.driver_cpu.as_ref()?.energy()?;
+        self.cpu_energy.watts(raw, 1 << 32, joules_per_unit)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cpu_power(&mut self) -> Option<f32> {
+        self.cpu_power.watts()
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn cpu_power(&mut self) -> Option<f32> {
+        None
+    }
+
+    #[cfg(windows)]
+    fn cpu_power_hint(&self) -> Option<&'static str> {
+        self.cpu_hint()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cpu_power_hint(&self) -> Option<&'static str> {
+        self.cpu_power
+            .denied
+            .then_some("needs read access to the energy counter, see README")
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    fn cpu_power_hint(&self) -> Option<&'static str> {
+        None
     }
 
     /// What the user can do to get a CPU reading, when there is none.

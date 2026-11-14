@@ -9,8 +9,8 @@ switched at any time from the window:
 - **Half** – about 50% utilisation
 - **Full** – 100% utilisation
 
-The window also shows CPU and GPU temperatures: current, min, max, average
-since start and average over the last five minutes.
+The window also shows power draw and temperature for the CPU and GPU:
+current, min, max, average since start and average over the last five minutes.
 
 ## Building
 
@@ -29,10 +29,16 @@ Windows (cross-compiled from Linux, needs `mingw-w64` and
 
 Both start at Off unless given on the command line.
 
+For development on Windows, setting the environment variable
+`PC_HEATER_NO_ELEVATE` skips the administrator prompt at startup.
+
 ## Notes
 
-- The GPU load runs through Vulkan on Linux and DirectX 12 on Windows, so it
-  works on any vendor's card.
+- The GPU load is an off-screen rendering job (blended layers of texture
+  reads and arithmetic) that runs through Vulkan on Linux and DirectX 12 on
+  Windows, so it works on any vendor's card. Windows Task Manager can show
+  well under 100% for it even when the card is at its power limit; go by the
+  power reading.
 - Temperature sources:
 
   |            | Linux                         | Windows                          |
@@ -49,6 +55,14 @@ Both start at Off unless given on the command line.
   is missing, it installs it automatically with
   `winget install namazso.PawnIO`. If you decline the prompt, everything else
   still works and the CPU temperature shows "no sensor found".
+
+- Power draw is shown next to the temperatures. GPU power comes from the
+  graphics driver. CPU power comes from the processor's own energy counter:
+  on Windows through PawnIO (so it needs administrator, like the CPU
+  temperature); on Linux the kernel only lets root read it by default. To
+  allow it until the next reboot:
+
+      sudo chmod a+r /sys/class/powercap/intel-rapl:*/energy_uj
 
 ## Third-party components
 

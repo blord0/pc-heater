@@ -4,6 +4,8 @@ mod cpu;
 mod gpu;
 mod shared;
 mod temps;
+#[cfg(target_os = "linux")]
+mod linsensor;
 #[cfg(windows)]
 mod winsensor;
 
@@ -14,9 +16,9 @@ use eframe::egui;
 use sysinfo::System;
 
 use shared::{GpuState, Mode, ModeCell, Shared};
-use temps::TempStats;
+use temps::Stats;
 
-const WINDOW_WIDTH: f32 = 380.0;
+const WINDOW_WIDTH: f32 = 440.0;
 const USAGE_REFRESH: Duration = Duration::from_millis(1000);
 
 fn main() -> eframe::Result {
@@ -30,7 +32,10 @@ fn main() -> eframe::Result {
     // always offer to restart elevated. If that is declined, carry on
     // without it.
     #[cfg(windows)]
-    if !winsensor::is_elevated() && winsensor::relaunch_elevated() {
+    if std::env::var_os("PC_HEATER_NO_ELEVATE").is_none()
+        && !winsensor::is_elevated()
+        && winsensor::relaunch_elevated()
+    {
         return Ok(());
     }
 
@@ -125,7 +130,12 @@ impl eframe::App for HeaterApp {
             } else {
                 ui.weak(format!("{} threads", self.cpu_threads));
             }
-            temp_readout(ui, "cpu_temps", &temps.cpu, temps.cpu_hint);
+            readout(
+                ui,
+                "cpu_readout",
+                (&temps.cpu_power, temps.cpu_power_hint),
+                (&temps.cpu, temps.cpu_hint),
+            );
 
             ui.add_space(4.0);
             ui.separator();
@@ -148,7 +158,7 @@ impl eframe::App for HeaterApp {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
             }
-            temp_readout(ui, "gpu_temps", &temps.gpu, None);
+            readout(ui, "gpu_readout", (&temps.gpu_power, None), (&temps.gpu, None));
 
             // Keep the window exactly tall enough for everything above.
             // The cursor sits just below the last widget; the panel itself
@@ -181,34 +191,44 @@ fn mode_selector(ui: &mut egui::Ui, cell: &ModeCell, enabled: bool) {
     });
 }
 
-fn temp_readout(ui: &mut egui::Ui, id: &str, stats: &TempStats, hint: Option<&str>) {
-    if !stats.has_data() {
-        match hint {
-            Some(hint) => ui.weak(format!("Temperature: no sensor found ({hint})")),
-            None => ui.weak("Temperature: no sensor found"),
-        };
-        return;
+/// Power and temperature statistics for one device, as an aligned table.
+fn readout(
+    ui: &mut egui::Ui,
+    id: &str,
+    power: (&Stats, Option<&str>),
+    temp: (&Stats, Option<&str>),
+) {
+    let rows = [("Power", "W", power), ("Temp", "°C", temp)];
+    egui::Grid::new(id).spacing([18.0, 4.0]).show(ui, |ui| {
+        for title in ["", "Now", "Min", "Max", "Avg (total)", "Avg (5 min)"] {
+            ui.weak(title);
+        }
+        ui.end_row();
+        for (name, unit, (stats, _)) in &rows {
+            ui.weak(*name);
+            if stats.has_data() {
+                match stats.current {
+                    Some(value) => ui.strong(format!("{value:.0} {unit}")),
+                    None => ui.strong("–"),
+                };
+                ui.strong(format!("{:.0} {unit}", stats.min));
+                ui.strong(format!("{:.0} {unit}", stats.max));
+                ui.strong(format!("{:.1} {unit}", stats.avg_total()));
+                ui.strong(format!("{:.1} {unit}", stats.avg_recent()));
+            } else {
+                for _ in 0..5 {
+                    ui.weak("–");
+                }
+            }
+            ui.end_row();
+        }
+    });
+    for (name, _, (stats, hint)) in &rows {
+        if !stats.has_data() {
+            match hint {
+                Some(hint) => ui.weak(format!("{name}: no sensor found ({hint})")),
+                None => ui.weak(format!("{name}: no sensor found")),
+            };
+        }
     }
-    let now = stats
-        .current
-        .map_or_else(|| "–".to_owned(), |t| format!("{t:.0} °C"));
-    let cells = [
-        ("Now", now),
-        ("Min", format!("{:.0} °C", stats.min)),
-        ("Max", format!("{:.0} °C", stats.max)),
-        ("Avg (total)", format!("{:.1} °C", stats.avg_total())),
-        ("Avg (5 min)", format!("{:.1} °C", stats.avg_recent())),
-    ];
-    egui::Grid::new(id)
-        .spacing([18.0, 2.0])
-        .show(ui, |ui| {
-            for (title, _) in &cells {
-                ui.weak(*title);
-            }
-            ui.end_row();
-            for (_, value) in &cells {
-                ui.strong(value);
-            }
-            ui.end_row();
-        });
 }

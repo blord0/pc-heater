@@ -8,41 +8,63 @@ use eframe::wgpu;
 
 use crate::shared::{GpuState, Mode, Shared, lower_thread_priority};
 
-/// Number of f32 elements the shader works over (one invocation each).
-const ELEMENTS: u32 = 1 << 20;
-const WORKGROUP_SIZE: u32 = 64;
-/// Target duration of a single dispatch. Short enough that the desktop
-/// compositor still gets regular turns on the GPU.
-const TARGET_DISPATCH: Duration = Duration::from_millis(6);
-/// Submissions kept queued so the GPU never idles between dispatches.
+/// Side length of the off-screen image the load draws into.
+const TARGET_SIZE: u32 = 2048;
+/// Side length of the noise texture the load reads from.
+const NOISE_SIZE: u32 = 2048;
+/// Target duration of a single submission. Long enough that Windows counts
+/// the GPU as fully busy (shorter ones get under-reported in Task Manager),
+/// short enough that the desktop compositor still gets regular turns.
+const TARGET_SUBMIT: Duration = Duration::from_millis(14);
+/// Submissions kept queued so the GPU never idles between them.
 const QUEUE_DEPTH: usize = 2;
 /// Length of the busy part of one Half-mode cycle.
 const HALF_BURST: Duration = Duration::from_millis(50);
 const IDLE_POLL: Duration = Duration::from_millis(50);
-const MAX_ITERS: u32 = 1 << 22;
+const MAX_LAYERS: u32 = 1 << 20;
 
+/// Many blended full-screen layers, each doing a run of texture reads
+/// followed by arithmetic. Measured on an RTX 3070 Ti this mix draws the
+/// most power: it keeps the shader cores, texture units, blending and video
+/// memory all busy. Arithmetic alone leaves ~35 W unused, and scattered
+/// texture reads stall the cores and draw less still.
 const SHADER: &str = r#"
-struct Params {
-    iters: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) layer: f32,
 }
 
-@group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read_write> data: array<f32>;
+@group(0) @binding(0) var noise: texture_2d<f32>;
+@group(0) @binding(1) var noise_sampler: sampler;
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
-    if (i >= arrayLength(&data)) {
-        return;
+@vertex
+fn vertex(
+    @builtin(vertex_index) vertex: u32,
+    @builtin(instance_index) instance: u32,
+) -> VertexOutput {
+    // One triangle that covers the whole target.
+    let corner = vec2<f32>(f32((vertex << 1u) & 2u), f32(vertex & 2u));
+    var out: VertexOutput;
+    out.position = vec4<f32>(corner * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = corner;
+    out.layer = f32(instance);
+    return out;
+}
+
+@fragment
+fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+    var uv = in.uv * (1.0 + in.layer * 0.37) + vec2<f32>(in.layer * 0.113, in.layer * 0.071);
+    var sum = vec4<f32>(0.0);
+    for (var k = 0; k < 8; k = k + 1) {
+        sum = sum + textureSampleLevel(noise, noise_sampler, uv, 0.0);
+        uv = uv + vec2<f32>(0.0007, 0.0003);
     }
-    var v = data[i] + f32(i) * 0.000001;
-    for (var k = 0u; k < params.iters; k = k + 1u) {
+    var v = sum.x + in.uv.x;
+    for (var k = 0; k < 32; k = k + 1) {
         v = fract(sin(v * 12.9898 + f32(k)) * 43758.5453) + cos(v);
     }
-    data[i] = v;
+    return vec4<f32>(sum.rgb * 0.125 + v * 0.001, 0.25);
 }
 "#;
 
@@ -89,9 +111,11 @@ struct Burner {
     name: String,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
+    pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
-    params: wgpu::Buffer,
+    target_view: wgpu::TextureView,
+    /// Blended layers drawn per submission, sized by `calibrate`.
+    layers: u32,
     calibrated: bool,
 }
 
@@ -117,30 +141,86 @@ impl Burner {
         }))
         .map_err(|e| format!("Could not open GPU: {e}"))?;
 
+        let target_format = wgpu::TextureFormat::Rgba16Float;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("heater target"),
+            size: wgpu::Extent3d {
+                width: TARGET_SIZE,
+                height: TARGET_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let noise_extent = wgpu::Extent3d {
+            width: NOISE_SIZE,
+            height: NOISE_SIZE,
+            depth_or_array_layers: 1,
+        };
+        let noise = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("heater noise"),
+            size: noise_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            noise.as_image_copy(),
+            &noise_pixels(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(NOISE_SIZE * 4),
+                rows_per_image: Some(NOISE_SIZE),
+            },
+            noise_extent,
+        );
+        let noise_view = noise.create_view(&wgpu::TextureViewDescriptor::default());
+        let noise_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("heater noise"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("heater"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("heater"),
             layout: None,
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
             cache: None,
-        });
-
-        let params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let data = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("data"),
-            size: u64::from(ELEMENTS) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("heater"),
@@ -148,11 +228,11 @@ impl Burner {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: params.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&noise_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: data.as_entire_binding(),
+                    resource: wgpu::BindingResource::Sampler(&noise_sampler),
                 },
             ],
         });
@@ -163,15 +243,10 @@ impl Burner {
             queue,
             pipeline,
             bind_group,
-            params,
+            target_view,
+            layers: 1,
             calibrated: false,
         })
-    }
-
-    fn set_iters(&self, iters: u32) {
-        let mut bytes = [0u8; 16];
-        bytes[..4].copy_from_slice(&iters.to_le_bytes());
-        self.queue.write_buffer(&self.params, 0, &bytes);
     }
 
     fn submit(&self) -> wgpu::SubmissionIndex {
@@ -179,10 +254,22 @@ impl Burner {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.dispatch_workgroups(ELEMENTS / WORKGROUP_SIZE, 1, 1);
+            pass.draw(0..3, 0..self.layers);
         }
         self.queue.submit(Some(encoder.finish()))
     }
@@ -197,34 +284,34 @@ impl Burner {
             .map_err(|e| format!("GPU stopped responding: {e}"))
     }
 
-    /// Scale the per-dispatch workload so one dispatch takes roughly
-    /// `TARGET_DISPATCH` on this particular GPU.
+    /// Pick the number of layers so that one submission takes roughly
+    /// `TARGET_SUBMIT` on this particular GPU.
     fn calibrate(&mut self) -> Result<(), String> {
         if self.calibrated {
             return Ok(());
         }
-        let mut iters: u32 = 16;
-        // The first dispatch includes one-off driver warm-up, so discard it.
-        self.set_iters(iters);
+        self.layers = 4;
+        // The first submission includes one-off driver warm-up, so discard it.
         self.wait(self.submit())?;
         loop {
-            self.set_iters(iters);
             let start = Instant::now();
             self.wait(self.submit())?;
             let took = start.elapsed();
-            if took >= TARGET_DISPATCH.mul_f32(0.7) || iters >= MAX_ITERS {
+            let ratio = TARGET_SUBMIT.as_secs_f64() / took.as_secs_f64().max(1e-6);
+            let close_enough = took >= TARGET_SUBMIT.mul_f32(0.5);
+            // Far off: take big steps. Close: one proportional correction.
+            let scale = if close_enough { ratio } else { ratio.clamp(1.5, 8.0) };
+            self.layers = ((f64::from(self.layers) * scale).round() as u32).clamp(1, MAX_LAYERS);
+            if close_enough || self.layers >= MAX_LAYERS {
                 break;
             }
-            let scale = (TARGET_DISPATCH.as_secs_f64() / took.as_secs_f64().max(1e-6))
-                .clamp(1.5, 8.0);
-            iters = ((f64::from(iters) * scale) as u32).min(MAX_ITERS);
         }
         self.calibrated = true;
         Ok(())
     }
 
-    /// Run dispatches back to back while `keep_going` returns true, then
-    /// block until the GPU has drained everything that was queued.
+    /// Submit work back to back while `keep_going` returns true, then block
+    /// until the GPU has drained everything that was queued.
     fn burn_while(&self, keep_going: impl Fn() -> bool) -> Result<(), String> {
         let mut in_flight = VecDeque::with_capacity(QUEUE_DEPTH + 1);
         while keep_going() {
@@ -238,4 +325,18 @@ impl Burner {
         }
         Ok(())
     }
+}
+
+/// Random RGBA pixels for the noise texture.
+fn noise_pixels() -> Vec<u8> {
+    let mut state: u32 = 0x9E37_79B9;
+    let mut pixels = Vec::with_capacity((NOISE_SIZE * NOISE_SIZE * 4) as usize);
+    for _ in 0..NOISE_SIZE * NOISE_SIZE {
+        // xorshift32
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        pixels.extend_from_slice(&state.to_le_bytes());
+    }
+    pixels
 }
